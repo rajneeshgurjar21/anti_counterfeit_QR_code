@@ -302,6 +302,8 @@ def measure_in_frame_macro_acutance(warped_gray: np.ndarray, modules: int, box_s
     
     The top-left finder pattern consists of high-contrast 7x7 modules.
     Measuring its edge gradient gives the camera's baseline acutance on standard black ink.
+    Also measures the step-edge acuity (first-derivative slope) along the physical ink transitions,
+    which decisively separates 1st-generation industrial prints from 2nd-generation photocopies/reprints.
     """
     border = 4
     offset = border * box_size
@@ -323,6 +325,53 @@ def measure_in_frame_macro_acutance(warped_gray: np.ndarray, modules: int, box_s
     lap_tr = compute_edge_acutance(tr_finder)
     macro_lap = float(np.mean([lap_tl, lap_tr]))
     
+    # Measure physical step-edge transition slope across multiple finder pattern boundaries
+    edge_slopes = []
+    wh, ww = warped_gray.shape[:2]
+    # 1. Top horizontal edge of TL finder (y ~ offset)
+    y_min, y_max = max(0, offset - box_size), min(wh, offset + box_size)
+    x_min, x_max = max(0, offset + box_size), min(ww, offset + finder_w - box_size)
+    if y_max > y_min and x_max > x_min:
+        for x in range(x_min, x_max, 2):
+            prof = warped_gray[y_min:y_max, x].astype(np.float32)
+            if len(prof) > 1:
+                edge_slopes.append(np.max(np.abs(np.diff(prof))))
+                
+    # 2. Bottom horizontal edge of TL finder (y ~ offset + finder_w)
+    y_min2, y_max2 = max(0, offset + finder_w - box_size), min(wh, offset + finder_w + box_size)
+    if y_max2 > y_min2 and x_max > x_min:
+        for x in range(x_min, x_max, 2):
+            prof = warped_gray[y_min2:y_max2, x].astype(np.float32)
+            if len(prof) > 1:
+                edge_slopes.append(np.max(np.abs(np.diff(prof))))
+                
+    # 3. Left vertical edge of TL finder (x ~ offset)
+    x_min_l, x_max_l = max(0, offset - box_size), min(ww, offset + box_size)
+    y_min_l, y_max_l = max(0, offset + box_size), min(wh, offset + finder_w - box_size)
+    if x_max_l > x_min_l and y_max_l > y_min_l:
+        for y in range(y_min_l, y_max_l, 2):
+            prof = warped_gray[y, x_min_l:x_max_l].astype(np.float32)
+            if len(prof) > 1:
+                edge_slopes.append(np.max(np.abs(np.diff(prof))))
+
+    # 4. Right vertical edge of TL finder (x ~ offset + finder_w)
+    x_min_r, x_max_r = max(0, offset + finder_w - box_size), min(ww, offset + finder_w + box_size)
+    if x_max_r > x_min_r and y_max_l > y_min_l:
+        for y in range(y_min_l, y_max_l, 2):
+            prof = warped_gray[y, x_min_r:x_max_r].astype(np.float32)
+            if len(prof) > 1:
+                edge_slopes.append(np.max(np.abs(np.diff(prof))))
+
+    finder_edge_slope = float(np.mean(edge_slopes)) if edge_slopes else macro_grad
+    
+    # Measure solid black core uniformity (modules 6..8 of TL finder)
+    core_y1 = max(0, offset + 2 * box_size)
+    core_y2 = min(wh, offset + 5 * box_size)
+    core_x1 = max(0, offset + 2 * box_size)
+    core_x2 = min(ww, offset + 5 * box_size)
+    black_core = warped_gray[core_y1:core_y2, core_x1:core_x2]
+    black_core_std = float(np.std(black_core)) if black_core.size > 0 else 0.0
+
     # Estimate local dynamic range (white paper vs black ink)
     white_level = float(np.percentile(warped_gray, 95))
     black_level = float(np.percentile(warped_gray, 5))
@@ -331,6 +380,8 @@ def measure_in_frame_macro_acutance(warped_gray: np.ndarray, modules: int, box_s
     return {
         "macro_gradient": round(macro_grad, 2),
         "macro_laplacian": round(macro_lap, 2),
+        "finder_edge_slope": round(finder_edge_slope, 2),
+        "black_core_std": round(black_core_std, 2),
         "white_level": round(white_level, 1),
         "black_level": round(black_level, 1),
         "contrast_michelson": round(contrast_michelson, 3),
@@ -452,22 +503,24 @@ def compute_dot_morphology(inner_cand: np.ndarray) -> dict:
 def compute_mtf_matched_ncc(
     candidate: np.ndarray, 
     reference_digital: np.ndarray, 
-    macro_gradient: float
+    macro_gradient: float,
+    finder_edge_slope: float = None,
 ) -> tuple[float, tuple[int, int]]:
     """
     Computes camera-invariant Peak NCC by conditioning the digital master reference
-    with the camera's estimated optical point spread function (derived from macro_gradient).
+    with the camera's estimated optical point spread function (derived from in-frame MTF).
     This ensures mobile cameras with slight optical softening are not falsely penalized.
     """
     # Estimate optical blur sigma from macro-edge acutance
-    if macro_gradient >= 320.0:
-        est_sigma = 0.50
-    elif macro_gradient >= 220.0:
+    slope_ref = finder_edge_slope if finder_edge_slope is not None else macro_gradient
+    if slope_ref >= 120.0:
+        est_sigma = 0.40
+    elif slope_ref >= 80.0:
+        est_sigma = 0.60
+    elif slope_ref >= 58.0:
         est_sigma = 0.75
-    elif macro_gradient >= 140.0:
-        est_sigma = 0.95
     else:
-        est_sigma = 1.25
+        est_sigma = 0.85
 
     # Convolve reference with camera PSF
     ksize = int(np.ceil(est_sigma * 3) * 2 + 1)
@@ -823,6 +876,8 @@ def verify_anti_counterfeit_qr(
     macro_metrics = measure_in_frame_macro_acutance(warped_gray, modules=modules, box_size=canonical_box)
     macro_grad = macro_metrics["macro_gradient"]
     macro_lap  = macro_metrics["macro_laplacian"]
+    finder_edge_slope = macro_metrics.get("finder_edge_slope", 65.0)
+    black_core_std = macro_metrics.get("black_core_std", 3.0)
 
     # ── Step 2.3: Multi-Ratio CDP Extraction & MTF-Matched Template Match ───
     candidate_ratios = [cdp_ratio, 0.32, 0.30, 0.28, 0.34]
@@ -864,7 +919,9 @@ def verify_anti_counterfeit_qr(
         inner_cand = cand_cdp[pad_y:ch-pad_y, pad_x:cw-pad_x]
         inner_ref  = ref_np[pad_y:ch-pad_y,   pad_x:cw-pad_x]
 
-        curr_ncc, _ = compute_mtf_matched_ncc(inner_cand, inner_ref, macro_gradient=macro_grad)
+        curr_ncc, _ = compute_mtf_matched_ncc(
+            inner_cand, inner_ref, macro_gradient=macro_grad, finder_edge_slope=finder_edge_slope
+        )
         if curr_ncc > best_ncc:
             best_ncc             = curr_ncc
             best_candidate_tuple = (inner_cand, inner_ref, curr_ncc, r)
@@ -937,20 +994,35 @@ def verify_anti_counterfeit_qr(
     cdp_authenticity_score = round(float(ncc_norm * 100.0), 1)
 
     # 3. Reprint Risk Score [0 - 100] (Physical 2nd-gen reprint detection)
+    slope_risk = max(0.0, min(1.0, (56.0 - finder_edge_slope) / (56.0 - 42.0)))
+    
+    void_count = morph["void_count"]
+    if void_count >= 68:
+        void_risk = 0.0
+    elif void_count <= 18:
+        void_risk = 1.0
+    elif void_count < 62 and finder_edge_slope < 52.0:
+        void_risk = 0.85
+    else:
+        void_risk = 0.10
+
     rel_g_risk = max(0.0, min(1.0, (REL_ACUTANCE_GENUINE_MIN - rel_acutance) / (REL_ACUTANCE_GENUINE_MIN - REL_ACUTANCE_REPRINT_MAX)))
     rel_lap_risk = max(0.0, min(1.0, (REL_LAP_GENUINE_MIN - rel_lap) / (REL_LAP_GENUINE_MIN - REL_LAP_REPRINT_MAX)))
     hf_risk = max(0.0, min(1.0, (HF_GENUINE_MIN - cdp_hf) / (HF_GENUINE_MIN - HF_REPRINT_MAX)))
     
-    # Base reprint risk
-    raw_reprint_risk = rel_g_risk * 0.45 + rel_lap_risk * 0.35 + hf_risk * 0.20
+    # Combined multi-factor reprint risk
+    raw_reprint_risk = max(
+        slope_risk * 0.70 + void_risk * 0.30,
+        rel_g_risk * 0.45 + rel_lap_risk * 0.35 + hf_risk * 0.20
+    )
     
     # Decisive reprint / photocopy indicators:
-    if morph["is_photocopy"]:
-        raw_reprint_risk = max(raw_reprint_risk, 0.95)
+    if morph["is_photocopy"] or finder_edge_slope <= 48.0 or (finder_edge_slope < 52.0 and void_count < 62):
+        raw_reprint_risk = max(raw_reprint_risk, 0.88)
     elif rel_acutance < 0.80 or (rel_lap < 0.50 and cdp_hf < 0.0028) or (cdp_grad < 95.0 and macro_grad >= 105.0):
         # Check if this is a blurred genuine capture vs a counterfeit reprint:
-        # If Peak NCC is very high (>= 0.70) and relative acutance is near 0.85, it's mild blur of original
-        if peak_ncc >= 0.70 and rel_acutance >= 0.82 and not morph["is_photocopy"]:
+        # If Peak NCC is very high and physical finder edge slope is crisp, it's mild blur of original
+        if peak_ncc >= 0.70 and rel_acutance >= 0.82 and not morph["is_photocopy"] and finder_edge_slope >= 50.0:
             raw_reprint_risk = 0.45  # Borderline / Suspicious, not counterfeit!
         else:
             raw_reprint_risk = max(raw_reprint_risk, 0.88)
@@ -984,8 +1056,8 @@ def verify_anti_counterfeit_qr(
         verdict      = "COUNTERFEIT (PHOTOCOPY / REPRINT DETECTED)"
         message      = "Counterfeit Detected — This QR Code Appears to Be a Copy"
         verdict_desc = (
-            f"FAKE! Second-generation reprint or photocopy detected. Micro-dot acutance ratio collapsed "
-            f"(relative acutance={rel_acutance:.3f}, micro-gradient={cdp_grad:.1f}, HF energy={cdp_hf:.5f})."
+            f"FAKE! Second-generation reprint or photocopy detected. Physical edge acuity collapsed "
+            f"(finder edge slope={finder_edge_slope:.1f}, relative acutance={rel_acutance:.3f}, micro-voids={morph['void_count']})."
         )
         is_genuine   = False
 
@@ -1083,10 +1155,12 @@ def verify_anti_counterfeit_qr(
         f"PERSPECTIVE_CORRECTED:      True\n"
         f"IMAGE_QUALITY_SCORE:        {image_quality_score}%\n"
         f"NCC_SCORE:                  {round(peak_ncc, 4)}\n"
+        f"FINDER_EDGE_SLOPE:          {round(finder_edge_slope, 2)}\n"
         f"MACRO_GRADIENT:             {macro_grad}\n"
         f"CDP_GRADIENT:               {round(cdp_grad, 2)}\n"
         f"RELATIVE_ACUTANCE_RATIO:    {round(rel_acutance, 4)}\n"
         f"RELATIVE_LAPLACIAN_RATIO:   {round(rel_lap, 4)}\n"
+        f"MICRO_VOIDS:                {morph['void_count']}\n"
         f"FFT_SCORE:                  {round(cdp_hf, 6)}\n"
         f"CDP_AUTHENTICITY_SCORE:     {cdp_authenticity_score}%\n"
         f"REPRINT_RISK_SCORE:         {reprint_risk_score}%\n"
@@ -1133,6 +1207,7 @@ def verify_anti_counterfeit_qr(
             "dot_morphology_clump_ratio": morph["clump_ratio"],
             "dot_count":                  morph["dot_count"],
             "micro_void_count":           morph["void_count"],
+            "finder_edge_slope":          round(finder_edge_slope, 2),
             "is_photocopy_detected":      morph["is_photocopy"],
             "edge_ratio":                 round(edge_ratio, 3),
         },

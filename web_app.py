@@ -405,16 +405,16 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="metric-value" id="valNCC">--</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">Laplacian (Sharpness)</div>
-          <div class="metric-value" id="valLap">--</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">FFT High Freq</div>
-          <div class="metric-value" id="valFFT">--</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Acutance Gate</div>
+          <div class="metric-label">Print Acuity Slope</div>
           <div class="metric-value" id="valGate">--</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Reprint Risk</div>
+          <div class="metric-value" id="valReprintRisk">--</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Micro-Void Count</div>
+          <div class="metric-value" id="valVoidCount">--</div>
         </div>
       </div>
 
@@ -433,8 +433,8 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="metric-value" id="valClump">--</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">Morphology Score</div>
-          <div class="metric-value" id="valMorph">--</div>
+          <div class="metric-label">Laplacian Sharpness</div>
+          <div class="metric-value" id="valLap">--</div>
         </div>
       </div>
       
@@ -860,11 +860,20 @@ function renderResult(data) {
   document.getElementById('valNCC').textContent = m.peak_cross_correlation_ncc !== undefined ? m.peak_cross_correlation_ncc : (m.peak_ncc !== undefined ? m.peak_ncc : '--');
   document.getElementById('valLap').textContent = m.laplacian_edge_variance !== undefined ? m.laplacian_edge_variance : (m.edge_acutance_laplacian !== undefined ? m.edge_acutance_laplacian : '--');
   document.getElementById('valFFT').textContent = m.fft_high_freq_ratio !== undefined ? m.fft_high_freq_ratio : '--';
-  document.getElementById('valGate').textContent = m.sharpness_gate !== undefined ? m.sharpness_gate : (m.acutance_gate !== undefined ? m.acutance_gate : '--');
+  document.getElementById('valGate').textContent = m.finder_edge_slope !== undefined ? m.finder_edge_slope : (m.acutance_gate !== undefined ? m.acutance_gate : '--');
+  const riskEl = document.getElementById('valReprintRisk');
+  if (riskEl) {
+    const rScore = data.reprint_risk_score !== undefined ? data.reprint_risk_score : (m.reprint_risk_score !== undefined ? m.reprint_risk_score : 0);
+    riskEl.textContent = rScore + '%';
+    riskEl.style.color = (rScore >= 65) ? 'var(--danger)' : 'var(--success)';
+  }
+  const voidEl = document.getElementById('valVoidCount');
+  if (voidEl) {
+    voidEl.textContent = m.micro_void_count !== undefined ? m.micro_void_count : '--';
+  }
   document.getElementById('valPARatio').textContent = m.dot_morphology_pa_ratio !== undefined ? m.dot_morphology_pa_ratio : '--';
   document.getElementById('valDensity').textContent = m.dot_morphology_density !== undefined ? (m.dot_morphology_density * 100).toFixed(1) + '%' : '--';
   document.getElementById('valClump').textContent = m.dot_morphology_clump_ratio !== undefined ? m.dot_morphology_clump_ratio : '--';
-  document.getElementById('valMorph').textContent = m.morph_norm !== undefined ? m.morph_norm : '--';
 
   
   if (data.comparison_card_b64) {
