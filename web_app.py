@@ -857,23 +857,26 @@ function renderResult(data) {
   }
   
   const m = data.metrics || {};
-  document.getElementById('valNCC').textContent = m.peak_cross_correlation_ncc !== undefined ? m.peak_cross_correlation_ncc : (m.peak_ncc !== undefined ? m.peak_ncc : '--');
-  document.getElementById('valLap').textContent = m.laplacian_edge_variance !== undefined ? m.laplacian_edge_variance : (m.edge_acutance_laplacian !== undefined ? m.edge_acutance_laplacian : '--');
-  document.getElementById('valFFT').textContent = m.fft_high_freq_ratio !== undefined ? m.fft_high_freq_ratio : '--';
-  document.getElementById('valGate').textContent = m.finder_edge_slope !== undefined ? m.finder_edge_slope : (m.acutance_gate !== undefined ? m.acutance_gate : '--');
+  const setEl = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = (val !== undefined && val !== null) ? val : '--';
+  };
+  
+  setEl('valNCC', m.peak_cross_correlation_ncc !== undefined ? m.peak_cross_correlation_ncc : m.peak_ncc);
+  setEl('valLap', m.laplacian_edge_variance !== undefined ? m.laplacian_edge_variance : m.edge_acutance_laplacian);
+  setEl('valFFT', m.fft_high_freq_ratio);
+  setEl('valGate', m.finder_edge_slope !== undefined ? m.finder_edge_slope : m.acutance_gate);
+  
   const riskEl = document.getElementById('valReprintRisk');
   if (riskEl) {
     const rScore = data.reprint_risk_score !== undefined ? data.reprint_risk_score : (m.reprint_risk_score !== undefined ? m.reprint_risk_score : 0);
     riskEl.textContent = rScore + '%';
     riskEl.style.color = (rScore >= 65) ? 'var(--danger)' : 'var(--success)';
   }
-  const voidEl = document.getElementById('valVoidCount');
-  if (voidEl) {
-    voidEl.textContent = m.micro_void_count !== undefined ? m.micro_void_count : '--';
-  }
-  document.getElementById('valPARatio').textContent = m.dot_morphology_pa_ratio !== undefined ? m.dot_morphology_pa_ratio : '--';
-  document.getElementById('valDensity').textContent = m.dot_morphology_density !== undefined ? (m.dot_morphology_density * 100).toFixed(1) + '%' : '--';
-  document.getElementById('valClump').textContent = m.dot_morphology_clump_ratio !== undefined ? m.dot_morphology_clump_ratio : '--';
+  setEl('valVoidCount', m.micro_void_count);
+  setEl('valPARatio', m.dot_morphology_pa_ratio);
+  setEl('valDensity', m.dot_morphology_density !== undefined ? (m.dot_morphology_density * 100).toFixed(1) + '%' : '--');
+  setEl('valClump', m.dot_morphology_clump_ratio);
 
   
   if (data.comparison_card_b64) {

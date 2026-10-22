@@ -533,6 +533,56 @@ def compute_mtf_matched_ncc(
     return best_ncc, loc_matched
 
 
+def compute_cdp_micro_fidelity(cand_cdp: np.ndarray, ref_cdp: np.ndarray) -> dict:
+    """
+    Computes cryptographic micro-dot fidelity against the deterministic master reference.
+    Evaluates:
+      1. Raw full-resolution NCC
+      2. Laplacian high-pass micro-edge correlation
+      3. Difference-of-Gaussians (DoG) bandpass correlation at micro-dot scale
+      4. Composite Master Fidelity Score
+    
+    In 1st-generation original prints (even under softer camera focus),
+    the micro-dots retain coherent high-frequency alignment with the cryptographic seed.
+    In 2nd-generation copies/reprints, micro-dot boundaries are irreversibly scrambled
+    by the 2nd print-and-scan cycle, causing micro-dot fidelity to collapse.
+    """
+    if cand_cdp is None or ref_cdp is None or cand_cdp.size == 0 or ref_cdp.size == 0:
+        return {
+            "raw_ncc": 0.0,
+            "lap_ncc": 0.0,
+            "dog_ncc": 0.0,
+            "fidelity": 0.0,
+        }
+        
+    pad_y = int(cand_cdp.shape[0] * 0.16)
+    pad_x = int(cand_cdp.shape[1] * 0.16)
+    c = cand_cdp[pad_y:-pad_y, pad_x:-pad_x].astype(np.float32)
+    r = ref_cdp[pad_y:-pad_y, pad_x:-pad_x].astype(np.float32)
+    
+    # 1. Raw unblurred NCC
+    raw_ncc, _ = compute_peak_cross_correlation(c, r)
+    
+    # 2. Laplacian high-pass micro-edge NCC
+    lap_c = cv2.Laplacian(c, cv2.CV_32F, ksize=3)
+    lap_r = cv2.Laplacian(r, cv2.CV_32F, ksize=3)
+    lap_ncc, _ = compute_peak_cross_correlation(lap_c, lap_r)
+    
+    # 3. Difference of Gaussians (DoG bandpass at micro-dot scale)
+    dog_c = cv2.GaussianBlur(c, (3, 3), 0.5) - cv2.GaussianBlur(c, (7, 7), 1.5)
+    dog_r = cv2.GaussianBlur(r, (3, 3), 0.5) - cv2.GaussianBlur(r, (7, 7), 1.5)
+    dog_ncc, _ = compute_peak_cross_correlation(dog_c, dog_r)
+    
+    fidelity = raw_ncc * 0.40 + dog_ncc * 0.40 + lap_ncc * 0.20
+    
+    return {
+        "raw_ncc": round(float(raw_ncc), 4),
+        "lap_ncc": round(float(lap_ncc), 4),
+        "dog_ncc": round(float(dog_ncc), 4),
+        "fidelity": round(float(fidelity), 4),
+    }
+
+
 # ─────────────────────────────────────────────
 #  Visual Card Generator
 # ─────────────────────────────────────────────
@@ -994,38 +1044,43 @@ def verify_anti_counterfeit_qr(
     cdp_authenticity_score = round(float(ncc_norm * 100.0), 1)
 
     # 3. Reprint Risk Score [0 - 100] (Physical 2nd-gen reprint detection)
-    slope_risk = max(0.0, min(1.0, (56.0 - finder_edge_slope) / (56.0 - 42.0)))
+    micro_fid = compute_cdp_micro_fidelity(inner_cand, inner_ref)
+    fidelity  = micro_fid["fidelity"]
+    dog_ncc   = micro_fid["dog_ncc"]
+    lap_ncc   = micro_fid["lap_ncc"]
     
-    void_count = morph["void_count"]
-    if void_count >= 68:
-        void_risk = 0.0
-    elif void_count <= 18:
-        void_risk = 1.0
-    elif void_count < 62 and finder_edge_slope < 52.0:
-        void_risk = 0.85
-    else:
-        void_risk = 0.10
-
-    rel_g_risk = max(0.0, min(1.0, (REL_ACUTANCE_GENUINE_MIN - rel_acutance) / (REL_ACUTANCE_GENUINE_MIN - REL_ACUTANCE_REPRINT_MAX)))
+    # Micro-structure fidelity risk:
+    fidelity_risk = max(0.0, min(1.0, (0.31 - fidelity) / (0.31 - 0.24)))
+    dog_risk      = max(0.0, min(1.0, (0.28 - dog_ncc) / (0.28 - 0.20)))
+    lap_risk      = max(0.0, min(1.0, (0.13 - lap_ncc) / (0.13 - 0.07)))
+    micro_risk    = fidelity_risk * 0.45 + dog_risk * 0.35 + lap_risk * 0.20
+    
+    slope_risk   = max(0.0, min(1.0, (56.0 - finder_edge_slope) / (56.0 - 42.0)))
+    rel_g_risk   = max(0.0, min(1.0, (REL_ACUTANCE_GENUINE_MIN - rel_acutance) / (REL_ACUTANCE_GENUINE_MIN - REL_ACUTANCE_REPRINT_MAX)))
     rel_lap_risk = max(0.0, min(1.0, (REL_LAP_GENUINE_MIN - rel_lap) / (REL_LAP_GENUINE_MIN - REL_LAP_REPRINT_MAX)))
-    hf_risk = max(0.0, min(1.0, (HF_GENUINE_MIN - cdp_hf) / (HF_GENUINE_MIN - HF_REPRINT_MAX)))
+    hf_risk      = max(0.0, min(1.0, (HF_GENUINE_MIN - cdp_hf) / (HF_GENUINE_MIN - HF_REPRINT_MAX)))
     
     # Combined multi-factor reprint risk
     raw_reprint_risk = max(
-        slope_risk * 0.70 + void_risk * 0.30,
+        micro_risk,
         rel_g_risk * 0.45 + rel_lap_risk * 0.35 + hf_risk * 0.20
     )
     
     # Decisive reprint / photocopy indicators:
-    if morph["is_photocopy"] or finder_edge_slope <= 48.0 or (finder_edge_slope < 52.0 and void_count < 62):
+    # 1. Micro-structure degradation (hallmark of second-generation copy)
+    if fidelity <= 0.28 or (dog_ncc <= 0.24 and lap_ncc <= 0.10):
         raw_reprint_risk = max(raw_reprint_risk, 0.88)
+    # 2. Severe morphology destruction
+    elif morph["is_photocopy"]:
+        raw_reprint_risk = max(raw_reprint_risk, 0.88)
+    # 3. Collapse of relative acutance
     elif rel_acutance < 0.80 or (rel_lap < 0.50 and cdp_hf < 0.0028) or (cdp_grad < 95.0 and macro_grad >= 105.0):
-        # Check if this is a blurred genuine capture vs a counterfeit reprint:
-        # If Peak NCC is very high and physical finder edge slope is crisp, it's mild blur of original
-        if peak_ncc >= 0.70 and rel_acutance >= 0.82 and not morph["is_photocopy"] and finder_edge_slope >= 50.0:
+        if peak_ncc >= 0.70 and rel_acutance >= 0.82 and not morph["is_photocopy"] and fidelity >= 0.30:
             raw_reprint_risk = 0.45  # Borderline / Suspicious, not counterfeit!
         else:
             raw_reprint_risk = max(raw_reprint_risk, 0.88)
+    elif fidelity >= 0.31 and dog_ncc >= 0.28:
+        raw_reprint_risk = min(raw_reprint_risk, 0.05)
         
     reprint_risk_score = round(float(raw_reprint_risk * 100.0), 1)
 
@@ -1207,6 +1262,9 @@ def verify_anti_counterfeit_qr(
             "dot_morphology_clump_ratio": morph["clump_ratio"],
             "dot_count":                  morph["dot_count"],
             "micro_void_count":           morph["void_count"],
+            "micro_dot_fidelity":         fidelity,
+            "dog_bandpass_ncc":           dog_ncc,
+            "laplacian_edge_ncc":         lap_ncc,
             "finder_edge_slope":          round(finder_edge_slope, 2),
             "is_photocopy_detected":      morph["is_photocopy"],
             "edge_ratio":                 round(edge_ratio, 3),
