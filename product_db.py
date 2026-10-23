@@ -51,7 +51,7 @@ def init_db():
     );
     """)
     
-    # Pre-seed a few sample products if table is empty
+    # Pre-seed sample products if table is empty
     cursor.execute("SELECT COUNT(*) FROM products")
     if cursor.fetchone()[0] == 0:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -73,7 +73,8 @@ def register_product(
     batch_no: str,
     mfg_date: str = "",
     exp_date: str = "",
-    mrp: str = ""
+    mrp: str = "",
+    status: str = "ACTIVE"
 ) -> bool:
     """Registers or updates a product in the database."""
     conn = get_connection()
@@ -82,15 +83,16 @@ def register_product(
     
     cursor.execute("""
     INSERT INTO products (serial_no, product_name, brand_name, batch_no, mfg_date, exp_date, mrp, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(serial_no) DO UPDATE SET
         product_name=excluded.product_name,
         brand_name=excluded.brand_name,
         batch_no=excluded.batch_no,
         mfg_date=excluded.mfg_date,
         exp_date=excluded.exp_date,
-        mrp=excluded.mrp;
-    """, (serial_no, product_name, brand_name, batch_no, mfg_date, exp_date, mrp, now))
+        mrp=excluded.mrp,
+        status=excluded.status;
+    """, (serial_no, product_name, brand_name, batch_no, mfg_date, exp_date, mrp, status, now))
     
     conn.commit()
     conn.close()
@@ -138,57 +140,85 @@ def record_scan(serial_no: str, physical_verdict: str, authenticity_score: float
             "exp_date": "N/A",
             "mrp": "N/A",
             "scan_count": 1,
+            "status": "UNREGISTERED",
             "first_scanned_at": now,
-            "db_status": "UNREGISTERED (Not Found in Official Registry)",
+            "last_scanned_at": now,
             "clone_alert": True,
-            "clone_message": "CRITICAL: Serial number does NOT exist in official brand database!"
+            "clone_message": "CRITICAL: This serial number does NOT exist in the official brand registry! Counterfeit packaging suspected."
         }
+        
+    product = dict(row)
+    new_scan_count = product["scan_count"] + 1
+    first_scanned = product["first_scanned_at"] or now
+    last_scanned = now
     
-    prod = dict(row)
-    new_count = prod["scan_count"] + 1
-    first_scan = prod["first_scanned_at"] or now
-    
+    # Update products table
     cursor.execute("""
     UPDATE products 
     SET scan_count = ?, first_scanned_at = ?, last_scanned_at = ?
     WHERE serial_no = ?
-    """, (new_count, first_scan, now, serial_no))
+    """, (new_scan_count, first_scanned, last_scanned, serial_no))
     
-    # Note on duplicate scan attempts
-    note = "NORMAL_FIRST_SCAN" if new_count == 1 else f"REPEAT_SCAN_COUNT_{new_count}"
+    # Insert audit log
+    clone_note = f"SCAN_COUNT_{new_scan_count}"
+    if new_scan_count > 1:
+        clone_note = f"CLONE_SUSPECTED_COUNT_{new_scan_count}"
+        
     cursor.execute("""
     INSERT INTO scan_logs (serial_no, scanned_at, physical_verdict, authenticity_score, scan_number, note)
     VALUES (?, ?, ?, ?, ?, ?)
-    """, (serial_no, now, physical_verdict, authenticity_score, new_count, note))
+    """, (serial_no, now, physical_verdict, authenticity_score, new_scan_count, clone_note))
     
     conn.commit()
     conn.close()
     
-    # Clone attack detection logic
+    # Assess Clone / Duplication Risk
     clone_alert = False
-    clone_message = "Valid Product. First time verified."
-    if new_count > 1:
-        clone_alert = True
-        clone_message = f"WARNING: This QR code has already been scanned {new_count} times! (First scanned: {first_scan}). Possible clone or reused packaging!"
-
-    prod["scan_count"] = new_count
-    prod["first_scanned_at"] = first_scan
-    prod["last_scanned_at"] = now
-    prod["is_registered"] = True
-    prod["db_status"] = "REGISTERED & VERIFIED"
-    prod["clone_alert"] = clone_alert
-    prod["clone_message"] = clone_message
+    clone_message = "Valid scan. Product is registered and active."
     
-    return prod
+    if new_scan_count == 1:
+        clone_message = "1st-Time Scan Verified! Official product authenticated for the first time."
+    elif new_scan_count == 2:
+        clone_alert = True
+        clone_message = f"WARNING: Label previously verified on {first_scanned}. If this is a new unopened package, it may be a cloned counterfeit label."
+    else:
+        clone_alert = True
+        clone_message = f"CRITICAL ALERT: This QR code has been scanned {new_scan_count} times! Multiple retail locations or cloned labels detected."
+        
+    return {
+        "is_registered": True,
+        "serial_no": product["serial_no"],
+        "product_name": product["product_name"],
+        "brand_name": product["brand_name"],
+        "batch_no": product["batch_no"],
+        "mfg_date": product["mfg_date"],
+        "exp_date": product["exp_date"],
+        "mrp": product["mrp"],
+        "status": product["status"],
+        "scan_count": new_scan_count,
+        "first_scanned_at": first_scanned,
+        "last_scanned_at": last_scanned,
+        "clone_alert": clone_alert,
+        "clone_message": clone_message
+    }
 
-def list_all_products(limit: int = 50) -> List[Dict[str, Any]]:
-    """Returns list of recent registered products."""
+def get_all_products() -> List[Dict[str, Any]]:
+    """Returns all registered products with their scan counts."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products ORDER BY created_at DESC LIMIT ?", (limit,))
+    cursor.execute("SELECT * FROM products ORDER BY created_at DESC")
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
-# Initialize on module load
+def get_scan_history(serial_no: str) -> List[Dict[str, Any]]:
+    """Returns scan audit history for a given serial number."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM scan_logs WHERE serial_no = ? ORDER BY id DESC", (serial_no,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# Initialize DB on module import
 init_db()

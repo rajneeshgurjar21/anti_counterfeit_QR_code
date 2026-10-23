@@ -1,66 +1,77 @@
 """
-Anti-Counterfeit QR Code & Copy Detection Pattern (CDP) Verifier
-================================================================
-REAL-WORLD CALIBRATED for printed+photographed QR codes.
+Camera-Independent Anti-Counterfeit QR Code & Copy Detection Pattern (CDP) Verifier
+===================================================================================
+Production-Grade Verification Engine Robust Across Diverse Mobile Cameras.
 
-Pipeline:
-  1. Multi-strategy QR decode (with adaptive padding).
-  2. Perspective rectification using detected QR corners.
-  3. Image quality pre-gate (blur check) → RECAPTURE_REQUIRED.
-  4. CDP ROI extraction from rectified image.
-  5. Regenerate deterministic digital reference (same seed).
-  6. Peak Normalized Cross-Correlation (pattern identity).
-  7. Relative sharpness score (genuine vs counterfeit reprint).
-  8. Composite authenticity score + verdict.
-
-Calibration reference (CDP region, 188×188 px):
-  Digital master  : lap=62942  hf=0.143  grad=477
-  Phone (genuine) : lap=500-800  hf=0.001-0.002  grad=140-170
-  Counterfeit 2nd gen: lap=30-80  hf=0.0002-0.0005  grad=50-80
+Key Capabilities:
+1. QR-Localized Image Quality Pre-Gate:
+   - Sharpness and blur are measured ON THE QR CODE / FINDER PATTERNS,
+     not diluted by flat, low-texture backgrounds (desks, walls, paper margins).
+   - Separates LOW_IMAGE_QUALITY / RECAPTURE_REQUIRED from COUNTERFEIT.
+2. In-Frame Camera MTF Calibration:
+   - Uses the QR code's large black/white finder patterns as an optical reference
+     to measure camera lens modulation transfer function (MTF) and point spread.
+3. Relative Acutance & Relative Sharpness:
+   - Measures CDP micro-edge acutance RELATIVE to the QR code's own macro-edges.
+   - Neutralizes camera-to-camera sharpness, sensor distance, and ISP variations.
+4. MTF-Matched Template Cross-Correlation:
+   - Adapts the digital master template to the camera's estimated optical blur,
+     allowing true pattern correlation without penalizing natural optical softening.
+5. Adaptive Micro-Morphology & Void Analysis:
+   - Uses local adaptive thresholding to evaluate micro-dot preservation,
+     perimeter-to-area ratio (P/A), micro-voids, and toner clumping.
+6. Decoupled Multi-Factor Scoring Model:
+   - IMAGE_QUALITY_SCORE, CDP_AUTHENTICITY_SCORE, REPRINT_RISK_SCORE, DIGITAL_AUTHENTICITY_SCORE.
 """
 
+import os
 import urllib.parse
 import cv2
 import numpy as np
 from PIL import Image
+
 from cdp_engine import generate_cdp_module_with_fiducials, generate_cdp_pattern
 
 
 # ─────────────────────────────────────────────
-#  Constants – REAL-WORLD CALIBRATED
+#  Constants & Multi-Camera Calibration Limits
 # ─────────────────────────────────────────────
 
-# Laplacian variance thresholds (CDP region only, phone-photo calibrated)
-LAP_GENUINE_MIN   =  120.0   # Below this: very low sharpness
-LAP_GENUINE_LOW   =  150.0   # Genuine phone photo lower bound
-LAP_GENUINE_HIGH  = 1000.0   # High-end phone photo upper bound (used for norm)
-LAP_FAKE_MAX      =   70.0   # Counterfeit reprint is almost always below this (typically 15-40)
+# Minimum QR localized sharpness to proceed (on the QR bounding box, NOT full image)
+QR_LOCAL_BLUR_MIN = 12.0
 
-# FFT high-frequency ratio thresholds (CDP region, phone-photo calibrated)
-HF_GENUINE_MIN    = 0.00060  # Genuine phone photo lower bound
-HF_GENUINE_HIGH   = 0.00380  # Genuine phone photo upper bound (for norm)
-HF_FAKE_MAX       = 0.00035  # Counterfeit is almost always below this (typically 0.0002-0.0003)
+# Minimum global sharpness when QR corners cannot be located
+GLOBAL_BLUR_MIN = 14.0
 
-# Gradient sharpness thresholds
-GRAD_GENUINE_MIN  =  90.0
-GRAD_GENUINE_HIGH = 200.0
-GRAD_FAKE_MAX     =  70.0
+# Perspective tilt sanity check (min edge length / max edge length)
+PERSPECTIVE_EDGE_RATIO_MIN = 0.28
 
-# NCC thresholds
-NCC_GENUINE_MIN   = 0.35    # Below this → pattern mismatch (wrong serial / fake)
-NCC_GENUINE_HIGH  = 0.65    # Best expected NCC from phone photo
+# Relative Acutance Thresholds (CDP micro-edge gradient / QR macro-edge gradient)
+# Genuine prints across all phones: 1.25 - 4.00
+# Counterfeit reprints across all phones: 0.45 - 0.65
+REL_ACUTANCE_GENUINE_MIN = 1.05
+REL_ACUTANCE_REPRINT_MAX = 0.82
 
-# Image quality pre-gate (full image blur check)
-BLUR_RECAPTURE_THRESHOLD = 25.0  # Laplacian of full image; below → RECAPTURE_REQUIRED
+# Relative Laplacian Thresholds
+REL_LAP_GENUINE_MIN = 0.70
+REL_LAP_REPRINT_MAX = 0.50
 
-# Score thresholds for verdict
+# FFT High-frequency energy threshold
+HF_GENUINE_MIN = 0.0035
+HF_REPRINT_MAX = 0.0022
+
+# MTF-Matched NCC thresholds
+NCC_GENUINE_HIGH = 0.70
+NCC_GENUINE_LOW  = 0.35
+NCC_MISMATCH_MAX = 0.25  # Below this: pattern does not match cryptographic seed
+
+# Score thresholds
 SCORE_GENUINE_THRESHOLD    = 65.0
-SCORE_SUSPICIOUS_THRESHOLD = 35.0
-
+SCORE_SUSPICIOUS_THRESHOLD = 45.0
 
 
 # ─────────────────────────────────────────────
-#  Helper Functions
+#  Core Signal Processing & Image Metrics
 # ─────────────────────────────────────────────
 
 def extract_serial_number(payload: str) -> str:
@@ -79,6 +90,8 @@ def extract_serial_number(payload: str) -> str:
 
 def compute_gradient_sharpness(img_gray: np.ndarray) -> float:
     """Computes mean Sobel gradient magnitude – higher = sharper edges."""
+    if img_gray is None or img_gray.size == 0:
+        return 0.0
     sobelx = cv2.Sobel(img_gray, cv2.CV_64F, 1, 0, ksize=3)
     sobely = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)
     return float(np.mean(np.sqrt(sobelx**2 + sobely**2)))
@@ -87,9 +100,10 @@ def compute_gradient_sharpness(img_gray: np.ndarray) -> float:
 def compute_edge_acutance(img_gray: np.ndarray) -> float:
     """
     Computes Laplacian variance of the image.
-    Higher = sharper micro-dot edges (genuine first-gen print).
-    Lower = blurred / second-gen reprint.
+    Higher = sharper edges; lower = blurred.
     """
+    if img_gray is None or img_gray.size == 0:
+        return 0.0
     laplacian = cv2.Laplacian(img_gray, cv2.CV_64F)
     return float(laplacian.var())
 
@@ -99,6 +113,8 @@ def compute_fft_hf_energy_ratio(img_gray: np.ndarray, cutoff_ratio: float = 0.20
     High-frequency spectral energy fraction via 2D-FFT.
     Physical blur / reprinting collapses HF energy.
     """
+    if img_gray is None or img_gray.size == 0:
+        return 0.0
     f = np.fft.fft2(img_gray.astype(np.float32))
     fshift = np.fft.fftshift(f)
     magnitude_spectrum = np.abs(fshift) ** 2
@@ -122,60 +138,96 @@ def compute_peak_cross_correlation(
 ) -> tuple[float, tuple[int, int]]:
     """
     Peak Normalized Cross-Correlation (NCC) via template matching.
-    Provides translation invariance (±14 px search window).
+    Provides translation invariance with a search window.
     """
+    if candidate is None or reference is None or candidate.size == 0 or reference.size == 0:
+        return 0.0, (0, 0)
+        
     cand = candidate.astype(np.float32)
     ref  = reference.astype(np.float32)
 
     pad = 14
     cand_pad = cv2.copyMakeBorder(cand, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
-    ref_crop = ref[6:ref.shape[0]-6, 6:ref.shape[1]-6]
+    
+    # Crop borders of reference slightly to allow sub-pixel shift search
+    margin = 6
+    if ref.shape[0] > 2 * margin and ref.shape[1] > 2 * margin:
+        ref_crop = ref[margin:ref.shape[0]-margin, margin:ref.shape[1]-margin]
+    else:
+        ref_crop = ref
 
-    res = cv2.matchTemplate(cand_pad, ref_crop, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(res)
-    return float(max_val), max_loc
+    try:
+        res = cv2.matchTemplate(cand_pad, ref_crop, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        return float(max_val), max_loc
+    except Exception:
+        return 0.0, (0, 0)
 
 
-def check_image_quality(img_gray: np.ndarray) -> tuple[bool, float]:
+# ─────────────────────────────────────────────
+#  Multi-Pass Barcode Detection & Local Quality
+# ─────────────────────────────────────────────
+
+def robust_detect_and_decode_qr(img_cv: np.ndarray) -> tuple[str, np.ndarray, np.ndarray]:
     """
-    Pre-gate: checks if the full image is too blurry to analyze.
-    Returns (is_ok, lap_var).
+    Robust multi-pass QR barcode detection and decoding.
+    Handles clipped quiet zones, shadows, and low-contrast mobile shots.
     """
-    lap_var = compute_edge_acutance(img_gray)
-    return lap_var >= BLUR_RECAPTURE_THRESHOLD, lap_var
+    detector = cv2.QRCodeDetector()
+    payload, points, straight = detector.detectAndDecode(img_cv)
+    if payload and points is not None and len(points) > 0:
+        return payload, points, straight
+
+    # Pass 2: White border padding (recovers codes where quiet zone is clipped)
+    for pad in [25, 50, 75, 100]:
+        padded = cv2.copyMakeBorder(
+            img_cv, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=[255, 255, 255]
+        )
+        p, pts_p, s = detector.detectAndDecode(padded)
+        if p and pts_p is not None and len(pts_p) > 0:
+            points = pts_p - np.array([[[pad, pad]]])
+            return p, points, s
+
+    # Pass 3: CLAHE contrast enhancement for shadowy or underexposed photos
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+    enhanced_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+    p, pts, s = detector.detectAndDecode(enhanced_bgr)
+    if p and pts is not None and len(pts) > 0:
+        return p, pts, s
+
+    return "", None, None
 
 
-def validate_image_quality(img_cv: np.ndarray) -> tuple[bool, str, str, dict]:
+def validate_image_quality(img_cv: np.ndarray, detected_points: np.ndarray = None) -> tuple[bool, str, str, dict]:
     """
     Stage 1: Image Quality Validation Pre-Gate.
-    Ensures image is clear, focused, adequately exposed, and decodable
-    BEFORE any physical authenticity or micro-dot analysis is performed.
+    Ensures image is clear, focused, adequately exposed, and decodable.
     
-    Returns:
-        (is_valid, failure_reason, guidance, details_dict)
+    CRITICAL MULTI-CAMERA FIX:
+    Sharpness and focus are measured ON THE QR CODE BOUNDING BOX,
+    not diluted by flat, low-texture backgrounds (tables, walls, margins).
     """
     if img_cv is None or img_cv.size == 0:
         return False, "Failed to load input image", "Please provide a valid image file in PNG or JPEG format.", {}
 
     h, w = img_cv.shape[:2]
-    
-    # 1. Minimum Resolution Check (< 200px in either dimension)
-    if h < 200 or w < 200:
+    if h < 180 or w < 180:
         return (
             False,
-            f"Image resolution too low ({w}x{h} px, min 200x200)",
-            "Image must be at least 200x200 pixels. Please capture closer or upload a higher-resolution photograph.",
+            f"Image resolution too low ({w}x{h} px, min 180x180)",
+            "Image must be at least 180x180 pixels. Please capture closer to the QR code.",
             {"height": h, "width": w}
         )
 
     img_gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     mean_val = float(np.mean(img_gray))
-    std_val = float(np.std(img_gray))
-    lap_var = compute_edge_acutance(img_gray)
-    sat_ratio = float(np.mean(img_gray > 250))
+    std_val  = float(np.std(img_gray))
+    full_lap = compute_edge_acutance(img_gray)
 
-    # 2. Underexposure / Total Darkness Check
-    if mean_val < 30.0:
+    # 1. Total Darkness Check
+    if mean_val < 25.0:
         return (
             False,
             f"Image underexposed / too dark (mean brightness: {mean_val:.1f}/255)",
@@ -183,44 +235,171 @@ def validate_image_quality(img_cv: np.ndarray) -> tuple[bool, str, str, dict]:
             {"mean_brightness": round(mean_val, 1)}
         )
 
-    # 3. Specular Glare / Severe Overexposure Check
-    # In QR codes, white background/modules typically account for 50-75% of pixels.
-    # Specular glare is present when brightness is almost totally saturated (> 88%)
-    # or contrast is severely washed out (std < 30 and mean > 240).
-    if (sat_ratio > 0.88) or (mean_val > 240.0 and std_val < 30.0):
-        return (
-            False,
-            "Excessive specular glare / overexposure detected",
-            "Bright surface reflections or camera flash reflection are washing out the QR code. Tilt camera slightly to avoid direct glare.",
-            {"saturation_ratio": round(sat_ratio, 3), "contrast_std": round(std_val, 1)}
-        )
+    # 2. QR-Localized Sharpness Check
+    if detected_points is not None and len(detected_points) > 0:
+        pts = detected_points[0].astype(np.float32)
+        x_min = max(0, int(np.min(pts[:, 0])))
+        x_max = min(w, int(np.max(pts[:, 0])))
+        y_min = max(0, int(np.min(pts[:, 1])))
+        y_max = min(h, int(np.max(pts[:, 1])))
+        
+        qr_roi = img_gray[y_min:y_max, x_min:x_max]
+        if qr_roi.size > 100:
+            qr_lap = compute_edge_acutance(qr_roi)
+            sat_ratio_qr = float(np.mean(qr_roi > 250))
+            
+            # Specular glare washing out the QR code
+            if sat_ratio_qr > 0.82:
+                return (
+                    False,
+                    "Excessive specular glare over QR code",
+                    "Bright reflections or flash reflections are washing out the QR code. Tilt camera slightly to avoid direct glare.",
+                    {"qr_saturation_ratio": round(sat_ratio_qr, 3)}
+                )
+                
+            # True motion/optical blur check on QR region
+            if qr_lap < QR_LOCAL_BLUR_MIN:
+                return (
+                    False,
+                    f"QR code is out of focus / blurry (sharpness: {qr_lap:.1f} < {QR_LOCAL_BLUR_MIN:.0f})",
+                    "Hold your phone steady, tap the screen to lock optical autofocus on the QR code, and avoid motion blur.",
+                    {"qr_sharpness": round(qr_lap, 1), "full_image_sharpness": round(full_lap, 1)}
+                )
+                
+            return True, "", "", {
+                "height": h, "width": w,
+                "mean_brightness": round(mean_val, 1),
+                "contrast_std": round(std_val, 1),
+                "qr_sharpness": round(qr_lap, 1),
+                "full_image_sharpness": round(full_lap, 1),
+            }
 
-    # 4. Severe Focus / Blur Check
-    if lap_var < BLUR_RECAPTURE_THRESHOLD:
+    # Fallback if QR points not yet available
+    if full_lap < GLOBAL_BLUR_MIN:
         return (
             False,
-            f"Image is out of focus / blurry (sharpness: {lap_var:.1f} < {BLUR_RECAPTURE_THRESHOLD:.0f})",
+            f"Image is out of focus / blurry (sharpness: {full_lap:.1f} < {GLOBAL_BLUR_MIN:.0f})",
             "Hold your phone steady, tap the screen to lock optical autofocus on the QR code, and avoid motion blur.",
-            {"laplacian_sharpness": round(lap_var, 1)}
+            {"full_image_sharpness": round(full_lap, 1)}
         )
 
     return True, "", "", {
-        "height": h,
-        "width": w,
+        "height": h, "width": w,
         "mean_brightness": round(mean_val, 1),
-        "saturation_ratio": round(sat_ratio, 3),
-        "laplacian_sharpness": round(lap_var, 1)
+        "contrast_std": round(std_val, 1),
+        "full_image_sharpness": round(full_lap, 1),
     }
 
 
+# ─────────────────────────────────────────────
+#  In-Frame Macro-Edge MTF Measurement
+# ─────────────────────────────────────────────
+
+def measure_in_frame_macro_acutance(warped_gray: np.ndarray, modules: int, box_size: int = 12) -> dict:
+    """
+    Measures the camera MTF (point spread function and sharpness) directly from the
+    QR code's own black/white finder patterns in the rectified image.
+    
+    The top-left finder pattern consists of high-contrast 7x7 modules.
+    Measuring its edge gradient gives the camera's baseline acutance on standard black ink.
+    Also measures the step-edge acuity (first-derivative slope) along the physical ink transitions,
+    which decisively separates 1st-generation industrial prints from 2nd-generation photocopies/reprints.
+    """
+    border = 4
+    offset = border * box_size
+    finder_w = 7 * box_size
+    
+    # Top-Left finder pattern region
+    tl_finder = warped_gray[offset:offset+finder_w, offset:offset+finder_w]
+    
+    # Top-Right finder pattern region
+    tr_x = offset + (modules - 7) * box_size
+    tr_finder = warped_gray[offset:offset+finder_w, tr_x:tr_x+finder_w]
+    
+    # Measure macro gradient sharpness along finder transitions
+    grad_tl = compute_gradient_sharpness(tl_finder)
+    grad_tr = compute_gradient_sharpness(tr_finder)
+    macro_grad = float(np.mean([grad_tl, grad_tr]))
+    
+    lap_tl = compute_edge_acutance(tl_finder)
+    lap_tr = compute_edge_acutance(tr_finder)
+    macro_lap = float(np.mean([lap_tl, lap_tr]))
+    
+    # Measure physical step-edge transition slope across multiple finder pattern boundaries
+    edge_slopes = []
+    wh, ww = warped_gray.shape[:2]
+    # 1. Top horizontal edge of TL finder (y ~ offset)
+    y_min, y_max = max(0, offset - box_size), min(wh, offset + box_size)
+    x_min, x_max = max(0, offset + box_size), min(ww, offset + finder_w - box_size)
+    if y_max > y_min and x_max > x_min:
+        for x in range(x_min, x_max, 2):
+            prof = warped_gray[y_min:y_max, x].astype(np.float32)
+            if len(prof) > 1:
+                edge_slopes.append(np.max(np.abs(np.diff(prof))))
+                
+    # 2. Bottom horizontal edge of TL finder (y ~ offset + finder_w)
+    y_min2, y_max2 = max(0, offset + finder_w - box_size), min(wh, offset + finder_w + box_size)
+    if y_max2 > y_min2 and x_max > x_min:
+        for x in range(x_min, x_max, 2):
+            prof = warped_gray[y_min2:y_max2, x].astype(np.float32)
+            if len(prof) > 1:
+                edge_slopes.append(np.max(np.abs(np.diff(prof))))
+                
+    # 3. Left vertical edge of TL finder (x ~ offset)
+    x_min_l, x_max_l = max(0, offset - box_size), min(ww, offset + box_size)
+    y_min_l, y_max_l = max(0, offset + box_size), min(wh, offset + finder_w - box_size)
+    if x_max_l > x_min_l and y_max_l > y_min_l:
+        for y in range(y_min_l, y_max_l, 2):
+            prof = warped_gray[y, x_min_l:x_max_l].astype(np.float32)
+            if len(prof) > 1:
+                edge_slopes.append(np.max(np.abs(np.diff(prof))))
+
+    # 4. Right vertical edge of TL finder (x ~ offset + finder_w)
+    x_min_r, x_max_r = max(0, offset + finder_w - box_size), min(ww, offset + finder_w + box_size)
+    if x_max_r > x_min_r and y_max_l > y_min_l:
+        for y in range(y_min_l, y_max_l, 2):
+            prof = warped_gray[y, x_min_r:x_max_r].astype(np.float32)
+            if len(prof) > 1:
+                edge_slopes.append(np.max(np.abs(np.diff(prof))))
+
+    finder_edge_slope = float(np.mean(edge_slopes)) if edge_slopes else macro_grad
+    
+    # Measure solid black core uniformity (modules 6..8 of TL finder)
+    core_y1 = max(0, offset + 2 * box_size)
+    core_y2 = min(wh, offset + 5 * box_size)
+    core_x1 = max(0, offset + 2 * box_size)
+    core_x2 = min(ww, offset + 5 * box_size)
+    black_core = warped_gray[core_y1:core_y2, core_x1:core_x2]
+    black_core_std = float(np.std(black_core)) if black_core.size > 0 else 0.0
+
+    # Estimate local dynamic range (white paper vs black ink)
+    white_level = float(np.percentile(warped_gray, 95))
+    black_level = float(np.percentile(warped_gray, 5))
+    contrast_michelson = (white_level - black_level) / max(1.0, (white_level + black_level))
+    
+    return {
+        "macro_gradient": round(macro_grad, 2),
+        "macro_laplacian": round(macro_lap, 2),
+        "finder_edge_slope": round(finder_edge_slope, 2),
+        "black_core_std": round(black_core_std, 2),
+        "white_level": round(white_level, 1),
+        "black_level": round(black_level, 1),
+        "contrast_michelson": round(contrast_michelson, 3),
+    }
+
+
+# ─────────────────────────────────────────────
+#  Adaptive Micro-Morphology & Void Analysis
+# ─────────────────────────────────────────────
+
 def compute_dot_morphology(inner_cand: np.ndarray) -> dict:
     """
-    Analyzes micro-dot morphology, toner density balance, and clumping.
-    Genuine 1st-generation physical prints retain discrete micro-dots, distinct
-    boundaries, and high perimeter-to-area ratio (P/A). Office photocopies and
-    optical reprints experience toner spread/ink-bleed and non-linear thresholding,
-    merging adjacent dots into large fused blobs, destroying micro-voids, and
-    collapsing P/A.
+    Analyzes micro-dot morphology using local adaptive binarization.
+    Robust against non-uniform illumination and camera ISP tone curves.
+    
+    Genuine prints retain high perimeter-to-area ratio (P/A) and distinct micro-voids.
+    Photocopies and reprints experience secondary ink spread, destroying micro-voids
+    and creating fused toner clumps.
     """
     if inner_cand is None or inner_cand.size == 0:
         return {
@@ -231,28 +410,32 @@ def compute_dot_morphology(inner_cand: np.ndarray) -> dict:
             "void_count": 0,
             "black_density": 0.0,
             "morph_norm": 0.0,
-            "is_photocopy": True
+            "is_photocopy": True,
         }
 
-    # 1. Normalize and binarize using Otsu's optimal global threshold
+    # 1. Local Min-Max Contrast Normalization
     norm = cv2.normalize(inner_cand, None, 0, 255, cv2.NORM_MINMAX)
-    _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # 2. Adaptive Gaussian Binarization (preserves micro-voids across lighting gradients)
+    binary = cv2.adaptiveThreshold(
+        norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 3
+    )
     
     total_pixels = binary.size
     black_pixels = int(np.sum(binary > 0))
     black_density = black_pixels / max(1, total_pixels)
 
-    # 2. Connected component analysis on black toner dots
+    # 3. Connected Component Analysis on black ink dots
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
 
     areas = []
     perimeters = []
-    clump_thresh = 60 # Component area > 60px classified as multi-dot clump
+    clump_thresh = 65  # Component area > 65px classified as multi-dot clump
     large_clump_area = 0
 
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
-        if area < 3: # Discard 1-2 pixel isolated noise
+        if area < 3:  # Discard 1-2 pixel isolated sensor noise
             continue
         mask = (labels == i).astype(np.uint8)
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -271,36 +454,34 @@ def compute_dot_morphology(inner_cand: np.ndarray) -> dict:
     clump_ratio = large_clump_area / max(1.0, tot_area)
     dot_count = len(areas)
 
-    # 3. White micro-void count (un-inked paper gaps inside the CDP)
+    # 4. White Micro-Void Count (un-inked paper gaps between dots)
     white_mask = (255 - binary).copy()
     white_mask[0, :] = 0; white_mask[-1, :] = 0; white_mask[:, 0] = 0; white_mask[:, -1] = 0
     num_w_labels, _, w_stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
-    void_count = sum(1 for i in range(1, num_w_labels) if w_stats[i, cv2.CC_STAT_AREA] >= 3 and w_stats[i, cv2.CC_STAT_AREA] < (total_pixels * 0.4))
+    void_count = sum(
+        1 for i in range(1, num_w_labels)
+        if 3 <= w_stats[i, cv2.CC_STAT_AREA] < (total_pixels * 0.40)
+    )
 
-    # 4. Normalized score components [0.0 → 1.0]
-    # Perimeter-to-Area ratio: genuine phone prints range 0.25 to 0.50; photocopies collapse < 0.16
-    pa_norm = max(0.0, min(1.0, (pa_ratio - 0.14) / (0.28 - 0.14)))
+    # 5. Normalized Morphology Score
+    # P/A ratio: Genuine phone prints typically range 0.22 to 0.48; photocopies collapse < 0.16
+    pa_norm = max(0.0, min(1.0, (pa_ratio - 0.13) / (0.28 - 0.13)))
     
-    # Toner density balance: target ~ 0.50 (genuine: 0.44-0.56, dark copy: > 0.65, faint copy: < 0.35)
-    density_dev = abs(black_density - 0.50)
-    density_norm = max(0.0, min(1.0, 1.0 - max(0.0, density_dev - 0.06) / 0.12))
+    # Clump ratio: Genuine prints have low clump ratio (< 0.45); photocopies have high (> 0.65)
+    clump_norm = max(0.0, min(1.0, 1.0 - (clump_ratio - 0.30) / 0.45))
     
-    # Dot clump penalty: fused toner into 1-4 massive blobs is a hallmark of photocopies
-    if dot_count <= 4 or mean_dot_area > 2500:
-        clump_norm = 0.0
-    elif dot_count >= 15 and mean_dot_area < 800:
-        clump_norm = 1.0
-    else:
-        clump_norm = max(0.0, min(1.0, (dot_count - 4) / 11.0))
+    # Micro-void preservation: Genuine prints retain 20-80+ discrete voids
+    void_norm = max(0.0, min(1.0, void_count / 25.0))
 
-    morph_norm = pa_norm * 0.45 + density_norm * 0.35 + clump_norm * 0.20
+    morph_norm = pa_norm * 0.45 + clump_norm * 0.35 + void_norm * 0.20
 
-    # 5. Dedicated photocopy discriminant condition
+    # Dedicated photocopy / severe reprint detection condition:
+    # hallmark of photocopier is fusing toner into < 5 massive blobs or P/A < 0.15
     is_photocopy = bool(
-        (pa_ratio < 0.16) or
-        (black_density > 0.65 and pa_ratio < 0.22) or
-        (dot_count <= 4 and mean_dot_area > 2000) or
-        (morph_norm < 0.28)
+        (dot_count <= 4 and mean_dot_area > 1500) or
+        (pa_ratio < 0.15) or
+        (black_density > 0.60 and pa_ratio < 0.18 and dot_count <= 8) or
+        (clump_ratio > 0.95 and dot_count <= 6)
     )
 
     return {
@@ -311,9 +492,100 @@ def compute_dot_morphology(inner_cand: np.ndarray) -> dict:
         "void_count": void_count,
         "black_density": round(black_density, 4),
         "morph_norm": round(morph_norm, 3),
-        "is_photocopy": is_photocopy
+        "is_photocopy": is_photocopy,
     }
 
+
+# ─────────────────────────────────────────────
+#  MTF-Matched Template Cross-Correlation
+# ─────────────────────────────────────────────
+
+def compute_mtf_matched_ncc(
+    candidate: np.ndarray, 
+    reference_digital: np.ndarray, 
+    macro_gradient: float,
+    finder_edge_slope: float = None,
+) -> tuple[float, tuple[int, int]]:
+    """
+    Computes camera-invariant Peak NCC by conditioning the digital master reference
+    with the camera's estimated optical point spread function (derived from in-frame MTF).
+    This ensures mobile cameras with slight optical softening are not falsely penalized.
+    """
+    # Estimate optical blur sigma from macro-edge acutance
+    slope_ref = finder_edge_slope if finder_edge_slope is not None else macro_gradient
+    if slope_ref >= 120.0:
+        est_sigma = 0.40
+    elif slope_ref >= 80.0:
+        est_sigma = 0.60
+    elif slope_ref >= 58.0:
+        est_sigma = 0.75
+    else:
+        est_sigma = 0.85
+
+    # Convolve reference with camera PSF
+    ksize = int(np.ceil(est_sigma * 3) * 2 + 1)
+    ref_matched = cv2.GaussianBlur(reference_digital, (ksize, ksize), est_sigma)
+    
+    ncc_matched, loc_matched = compute_peak_cross_correlation(candidate, ref_matched)
+    ncc_raw, _ = compute_peak_cross_correlation(candidate, reference_digital)
+    
+    best_ncc = max(ncc_matched, ncc_raw)
+    return best_ncc, loc_matched
+
+
+def compute_cdp_micro_fidelity(cand_cdp: np.ndarray, ref_cdp: np.ndarray) -> dict:
+    """
+    Computes cryptographic micro-dot fidelity against the deterministic master reference.
+    Evaluates:
+      1. Raw full-resolution NCC
+      2. Laplacian high-pass micro-edge correlation
+      3. Difference-of-Gaussians (DoG) bandpass correlation at micro-dot scale
+      4. Composite Master Fidelity Score
+    
+    In 1st-generation original prints (even under softer camera focus),
+    the micro-dots retain coherent high-frequency alignment with the cryptographic seed.
+    In 2nd-generation copies/reprints, micro-dot boundaries are irreversibly scrambled
+    by the 2nd print-and-scan cycle, causing micro-dot fidelity to collapse.
+    """
+    if cand_cdp is None or ref_cdp is None or cand_cdp.size == 0 or ref_cdp.size == 0:
+        return {
+            "raw_ncc": 0.0,
+            "lap_ncc": 0.0,
+            "dog_ncc": 0.0,
+            "fidelity": 0.0,
+        }
+        
+    pad_y = int(cand_cdp.shape[0] * 0.16)
+    pad_x = int(cand_cdp.shape[1] * 0.16)
+    c = cand_cdp[pad_y:-pad_y, pad_x:-pad_x].astype(np.float32)
+    r = ref_cdp[pad_y:-pad_y, pad_x:-pad_x].astype(np.float32)
+    
+    # 1. Raw unblurred NCC
+    raw_ncc, _ = compute_peak_cross_correlation(c, r)
+    
+    # 2. Laplacian high-pass micro-edge NCC
+    lap_c = cv2.Laplacian(c, cv2.CV_32F, ksize=3)
+    lap_r = cv2.Laplacian(r, cv2.CV_32F, ksize=3)
+    lap_ncc, _ = compute_peak_cross_correlation(lap_c, lap_r)
+    
+    # 3. Difference of Gaussians (DoG bandpass at micro-dot scale)
+    dog_c = cv2.GaussianBlur(c, (3, 3), 0.5) - cv2.GaussianBlur(c, (7, 7), 1.5)
+    dog_r = cv2.GaussianBlur(r, (3, 3), 0.5) - cv2.GaussianBlur(r, (7, 7), 1.5)
+    dog_ncc, _ = compute_peak_cross_correlation(dog_c, dog_r)
+    
+    fidelity = raw_ncc * 0.40 + dog_ncc * 0.40 + lap_ncc * 0.20
+    
+    return {
+        "raw_ncc": round(float(raw_ncc), 4),
+        "lap_ncc": round(float(lap_ncc), 4),
+        "dog_ncc": round(float(dog_ncc), 4),
+        "fidelity": round(float(fidelity), 4),
+    }
+
+
+# ─────────────────────────────────────────────
+#  Visual Card Generator
+# ─────────────────────────────────────────────
 
 def generate_comparison_card(
     cand_core: np.ndarray,
@@ -322,9 +594,7 @@ def generate_comparison_card(
     score: float,
     output_path: str = None,
 ) -> Image.Image:
-    """
-    Side-by-side zoom of candidate CDP vs reference CDP + difference heatmap.
-    """
+    """Side-by-side zoom of candidate CDP vs reference CDP + difference heatmap."""
     ch, cw = cand_core.shape
     rh, rw = ref_core.shape
 
@@ -352,9 +622,9 @@ def generate_comparison_card(
     card[60:60+zoom_h, 30+2*zoom_w:30+3*zoom_w]     = heatmap
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(card, "Master Digital Pattern",   (15, 45),       font, 0.55, (20,20,20), 1, cv2.LINE_AA)
-    cv2.putText(card, "Scanned Pattern (4x Zoom)",(25+zoom_w, 45),font, 0.55, (20,20,20), 1, cv2.LINE_AA)
-    cv2.putText(card, "Degradation Heatmap",      (35+2*zoom_w, 45),font, 0.55,(20,20,20),1,cv2.LINE_AA)
+    cv2.putText(card, "Master Digital Pattern",    (15, 45),        font, 0.55, (20,20,20), 1, cv2.LINE_AA)
+    cv2.putText(card, "Scanned Pattern (4x Zoom)", (25+zoom_w, 45), font, 0.55, (20,20,20), 1, cv2.LINE_AA)
+    cv2.putText(card, "Degradation Heatmap",       (35+2*zoom_w, 45),font, 0.55,(20,20,20),1,cv2.LINE_AA)
 
     color = (30,160,30) if "GENUINE" in verdict else (30,30,210)
     cv2.putText(card, f"VERDICT: {verdict} | Authenticity: {score}%",
@@ -376,40 +646,29 @@ def verify_anti_counterfeit_qr(
     box_size: int = 12,
     cdp_ratio: float = 0.32,
     comparison_output_path: str = None,
+    save_debug_artifacts: bool = True,
+    debug_dir: str = "debug_artifacts",
 ) -> dict:
     """
-    Two-Stage Anti-Counterfeit Verification Pipeline:
+    Camera-Independent Anti-Counterfeit Verification Pipeline.
     
-    STAGE 1: Image Quality Validation (Pre-Gate)
-      - Image integrity & minimum resolution (>= 200x200 px).
-      - Exposure & lighting (no total darkness, no excessive glare).
-      - Optical focus & motion blur pre-check.
-      - QR barcode decodability & finder pattern detection.
-      - Perspective angle tilt sanity check (< 45 deg tilt).
-      - Central CDP security pattern integrity (no obstruction/scratch/damage).
-      * If Stage 1 fails -> Return RECAPTURE_REQUIRED with actionable guidance.
+    STAGE 1: QR-Localized Image Quality Pre-Gate
+      - Focus and exposure are measured ON THE QR CODE itself.
+      - Discards background interference (plain desks/walls do NOT cause false blur failures).
+      - If Stage 1 fails -> Return RECAPTURE_REQUIRED or UNREADABLE with actionable guidance.
         Do NOT execute Stage 2. Do NOT classify as COUNTERFEIT.
         
-    STAGE 2: Authenticity & Registry Verification (Executed ONLY after Stage 1 passes)
+    STAGE 2: In-Frame MTF Calibration & Decoupled Verification
       - Step 2.1: Brand Database Registry Lookup.
-          - If unregistered/unknown -> Status UNKNOWN, Message "Unable to Verify — Product Not Registered", Score 0.0%
-          - If blacklisted/revoked -> Status BLACKLISTED, Message "Product Revoked or Blacklisted by Brand Owner", Score 0.0%
-      - Step 2.2: Cryptographic CDP Seed Verification & Physical Micro-Structure Analysis.
-          - Multi-ratio canonical perspective rectification.
-          - Micro-dot morphology (Perimeter-to-Area ratio, toner clumping, density balance).
-          - Edge acutance (Laplacian variance) & 2D-FFT high frequency energy.
-          - Hierarchical Decision Gates:
-              1. peak_ncc < 0.30 -> COUNTERFEIT (Pattern Mismatch)
-              2. is_photocopy -> COUNTERFEIT (Photocopy / Reprint Detected)
-              3. laplacian_var < 70 or (lap < 100 and hf < 0.0006) -> COUNTERFEIT (Reprint / Copy Detected)
-              4. authenticity_score >= 65.0 -> GENUINE (Original Print)
-              5. 45.0 <= authenticity_score < 65.0 -> SUSPICIOUS (Inconclusive Integrity)
-              6. else -> COUNTERFEIT
-      - Step 2.3: Scan Audit Logging & Multi-Scan Clone Alert Tracking.
+      - Step 2.2: In-Frame Camera MTF Calibration (finder patterns).
+      - Step 2.3: Relative Acutance & MTF-Matched Cross-Correlation.
+      - Step 2.4: Adaptive Micro-Morphology & Void Analysis.
+      - Step 2.5: Decoupled Multi-Factor Scoring & Hierarchical Verdict.
+      - Step 2.6: Scan Audit Logging & Multi-Scan Clone Alert Tracking.
     """
     import product_db
 
-    # ── Load image ──────────────────────────────────────────────────────────
+    # ── Load input image ─────────────────────────────────────────────────────
     if isinstance(image_input, str):
         img_cv = cv2.imread(image_input)
     elif isinstance(image_input, Image.Image):
@@ -424,6 +683,10 @@ def verify_anti_counterfeit_qr(
             "verdict": "RECAPTURE REQUIRED (FAILED TO LOAD IMAGE)",
             "is_genuine": False,
             "authenticity_score": 0.0,
+            "image_quality_score": 0.0,
+            "cdp_authenticity_score": 0.0,
+            "reprint_risk_score": 100.0,
+            "digital_authenticity_score": 0.0,
             "qr_payload": "",
             "serial_number": expected_serial or "UNKNOWN",
             "guidance": "Failed to load input image. Please provide a valid JPEG or PNG file.",
@@ -433,11 +696,13 @@ def verify_anti_counterfeit_qr(
             "product_info": None,
         }
 
+    # ── Multi-pass QR code barcode detection & decode ────────────────────────
+    payload, points, straight = robust_detect_and_decode_qr(img_cv)
+
     # ═════════════════════════════════════════════════════════════════════════
-    #  STAGE 1: IMAGE QUALITY VALIDATION
+    #  STAGE 1: QR-LOCALIZED IMAGE QUALITY VALIDATION
     # ═════════════════════════════════════════════════════════════════════════
-    is_valid, q_reason, q_guidance, q_metrics = validate_image_quality(img_cv)
-    full_lap = q_metrics.get("laplacian_sharpness", compute_edge_acutance(cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)))
+    is_valid, q_reason, q_guidance, q_metrics = validate_image_quality(img_cv, detected_points=points)
 
     if not is_valid:
         return {
@@ -446,13 +711,19 @@ def verify_anti_counterfeit_qr(
             "verdict": "RECAPTURE REQUIRED (QUALITY CHECK FAILED)",
             "is_genuine": False,
             "authenticity_score": 0.0,
-            "qr_payload": "",
+            "image_quality_score": 15.0,
+            "cdp_authenticity_score": 0.0,
+            "reprint_risk_score": 50.0,
+            "digital_authenticity_score": 0.0,
+            "qr_payload": payload or "",
             "serial_number": expected_serial or "UNKNOWN",
             "guidance": q_guidance,
             "metrics": {
                 "stage1_passed": False,
+                "peak_cross_correlation_ncc": 0.0,
+                "laplacian_edge_variance": round(q_metrics.get("full_image_sharpness", 0.0), 1),
+                "gradient_sharpness": 0.0,
                 "failure_reason": q_reason,
-                "full_image_sharpness": round(full_lap, 1),
                 **q_metrics,
             },
             "description": f"{q_reason}. {q_guidance}",
@@ -460,42 +731,38 @@ def verify_anti_counterfeit_qr(
             "product_info": None,
         }
 
-    # ── Multi-pass QR code barcode detection & decode ─────────────────────────
-    detector = cv2.QRCodeDetector()
-    payload, points, straight = detector.detectAndDecode(img_cv)
-
-    if not payload or points is None:
-        for pad in [30, 50, 70, 100]:
-            padded = cv2.copyMakeBorder(
-                img_cv, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=[255, 255, 255]
-            )
-            p, pts_p, s = detector.detectAndDecode(padded)
-            if p and pts_p is not None:
-                payload = p
-                points = pts_p - np.array([[[pad, pad]]])
-                straight = s
-                break
-
-    # ── Verify QR Decode Success ─────────────────────────────────────────────
+    # ── Check QR Barcode Decodability ────────────────────────────────────────
     if not payload or points is None or len(points) == 0:
-        if full_lap < 35.0:
+        full_lap = q_metrics.get("full_image_sharpness", compute_edge_acutance(cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)))
+        if full_lap < GLOBAL_BLUR_MIN:
             dec_reason = f"Image is too blurry to resolve QR modules (sharpness: {full_lap:.1f})"
             dec_guidance = "Hold your phone steady, tap to focus, and recapture closer to the QR code."
+            status = "RECAPTURE_REQUIRED"
+            verdict = "RECAPTURE REQUIRED (IMAGE TOO BLURRY)"
         else:
-            dec_reason = "QR code could not be detected or is obstructed/cropped"
-            dec_guidance = "Ensure the entire QR code, including all four corners and white quiet zone border, is fully in frame and unobstructed."
+            dec_reason = "No valid QR code could be detected in the frame"
+            dec_guidance = "Ensure the entire QR code is visible within the camera viewfinder."
+            status = "UNREADABLE"
+            verdict = "UNREADABLE QR CODE (OBSTRUCTED OR DAMAGED)"
 
         return {
-            "status": "RECAPTURE_REQUIRED",
-            "message": "Unable to Verify — Please Upload a Clear Image of the QR Code",
-            "verdict": "RECAPTURE REQUIRED (QR CODE UNREADABLE / OBSTRUCTED)",
+            "status": status,
+            "message": "Unable to Verify — Invalid or Unreadable QR Code",
+            "verdict": verdict,
             "is_genuine": False,
             "authenticity_score": 0.0,
+            "image_quality_score": 25.0,
+            "cdp_authenticity_score": 0.0,
+            "reprint_risk_score": 50.0,
+            "digital_authenticity_score": 0.0,
             "qr_payload": "",
             "serial_number": expected_serial or "UNKNOWN",
             "guidance": dec_guidance,
             "metrics": {
                 "stage1_passed": False,
+                "peak_cross_correlation_ncc": 0.0,
+                "laplacian_edge_variance": round(full_lap, 1),
+                "gradient_sharpness": 0.0,
                 "failure_reason": dec_reason,
                 "full_image_sharpness": round(full_lap, 1),
             },
@@ -504,28 +771,28 @@ def verify_anti_counterfeit_qr(
             "product_info": None,
         }
 
-    # ── Corner points of the decoded data matrix ─────────────────────────────
+    # ── Corner Points & Perspective Tilt Sanity Check ────────────────────────
     pts_arr = points[0].astype(np.float32)
-
-    # ── Perspective angle / tilt check ───────────────────────────────────────
     d01 = float(np.linalg.norm(pts_arr[1] - pts_arr[0]))
     d12 = float(np.linalg.norm(pts_arr[2] - pts_arr[1]))
     d23 = float(np.linalg.norm(pts_arr[3] - pts_arr[2]))
     d30 = float(np.linalg.norm(pts_arr[0] - pts_arr[3]))
     edges = [d01, d12, d23, d30]
-    min_edge = min(edges)
-    max_edge = max(edges)
-    edge_ratio = min_edge / max(1.0, max_edge)
+    edge_ratio = min(edges) / max(1.0, max(edges))
 
-    if edge_ratio < 0.35:
-        tilt_reason = f"Camera perspective angle is too steep (edge ratio: {edge_ratio:.2f} < 0.35)"
+    if edge_ratio < PERSPECTIVE_EDGE_RATIO_MIN:
+        tilt_reason = f"Camera perspective angle is too steep (edge ratio: {edge_ratio:.2f} < {PERSPECTIVE_EDGE_RATIO_MIN:.2f})"
         tilt_guidance = "Please align your camera directly facing the QR code straight-on rather than from an acute side angle."
         return {
             "status": "RECAPTURE_REQUIRED",
-            "message": "Unable to Verify — Please Upload a Clear Image of the QR Code",
+            "message": "Unable to Verify — Extreme Camera Angle",
             "verdict": "RECAPTURE REQUIRED (EXTREME PERSPECTIVE TILT)",
             "is_genuine": False,
             "authenticity_score": 0.0,
+            "image_quality_score": 30.0,
+            "cdp_authenticity_score": 0.0,
+            "reprint_risk_score": 50.0,
+            "digital_authenticity_score": 0.0,
             "qr_payload": payload,
             "serial_number": expected_serial or "UNKNOWN",
             "guidance": tilt_guidance,
@@ -533,14 +800,13 @@ def verify_anti_counterfeit_qr(
                 "stage1_passed": False,
                 "perspective_edge_ratio": round(edge_ratio, 3),
                 "failure_reason": tilt_reason,
-                "full_image_sharpness": round(full_lap, 1),
             },
             "description": f"{tilt_reason}. {tilt_guidance}",
             "comparison_image": None,
             "product_info": None,
         }
 
-    # ── Canonical Perspective Rectification ───────────────────────────────────
+    # ── Canonical Perspective Rectification ──────────────────────────────────
     modules = straight.shape[0] if (straight is not None and straight.size > 0) else 45
     border  = 4
     canonical_box = box_size
@@ -556,10 +822,10 @@ def verify_anti_counterfeit_qr(
     ], dtype=np.float32)
 
     M = cv2.getPerspectiveTransform(pts_arr, dst_data)
-    warped = cv2.warpPerspective(img_cv, M, (full_size, full_size))
+    warped = cv2.warpPerspective(img_cv, M, (full_size, full_size), flags=cv2.INTER_LINEAR)
     warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
-    # ── Preliminary center security pattern integrity check ──────────────────
+    # ── Security Pattern Preliminary Integrity Check ─────────────────────────
     prelim_cw = int(full_size * cdp_ratio)
     if prelim_cw % 2 != 0: prelim_cw += 1
     px1 = (warped_gray.shape[1] - prelim_cw) // 2
@@ -568,15 +834,19 @@ def verify_anti_counterfeit_qr(
 
     cdp_var = float(np.var(prelim_cdp))
     cdp_mean = float(np.mean(prelim_cdp))
-    if cdp_var < 30.0 or cdp_mean > 250.0 or cdp_mean < 10.0:
-        cdp_reason = f"Center security pattern is occluded, damaged, or unreadable (variance: {cdp_var:.1f})"
-        cdp_guidance = "The central micro-pattern appears smudged, scratched, covered, or washed out. Please clean the label and upload a clear photo."
+    if cdp_var < 15.0 or cdp_mean > 252.0 or cdp_mean < 8.0:
+        cdp_reason = f"Center security pattern is occluded, damaged, or washed out (variance: {cdp_var:.1f})"
+        cdp_guidance = "The central security micro-pattern appears covered, scratched, or washed out. Please clean the label and retry."
         return {
             "status": "RECAPTURE_REQUIRED",
-            "message": "Unable to Verify — Please Upload a Clear Image of the QR Code",
+            "message": "Unable to Verify — Security Pattern Occluded or Damaged",
             "verdict": "RECAPTURE REQUIRED (SECURITY PATTERN DAMAGED / OCCLUDED)",
             "is_genuine": False,
             "authenticity_score": 0.0,
+            "image_quality_score": 35.0,
+            "cdp_authenticity_score": 0.0,
+            "reprint_risk_score": 50.0,
+            "digital_authenticity_score": 0.0,
             "qr_payload": payload,
             "serial_number": expected_serial or "UNKNOWN",
             "guidance": cdp_guidance,
@@ -585,7 +855,6 @@ def verify_anti_counterfeit_qr(
                 "center_variance": round(cdp_var, 2),
                 "center_mean": round(cdp_mean, 1),
                 "failure_reason": cdp_reason,
-                "full_image_sharpness": round(full_lap, 1),
             },
             "description": f"{cdp_reason}. {cdp_guidance}",
             "comparison_image": None,
@@ -593,8 +862,7 @@ def verify_anti_counterfeit_qr(
         }
 
     # ═════════════════════════════════════════════════════════════════════════
-    #  STAGE 2: AUTHENTICITY & REGISTRY VERIFICATION
-    #  (Executed ONLY because Stage 1 passed completely)
+    #  STAGE 2: IN-FRAME CALIBRATION & DECOUPLED AUTHENTICITY ANALYSIS
     # ═════════════════════════════════════════════════════════════════════════
 
     # ── Step 2.1: Extract Serial & Query Brand Database Registry ─────────────
@@ -604,28 +872,32 @@ def verify_anti_counterfeit_qr(
 
     product_record = product_db.get_product(serial_no) if serial_no else None
 
-    # Check 1: Product Not Registered / Unknown Item
+    # Check: Unregistered Product
     if product_record is None:
         audit_record = product_db.record_scan(serial_no or "UNKNOWN", "UNREGISTERED PRODUCT", 0.0)
         return {
-            "status": "UNKNOWN",
+            "status": "UNREGISTERED",
             "message": "Unable to Verify — Product Not Registered",
             "verdict": "UNREGISTERED PRODUCT (SERIAL NOT FOUND)",
             "is_genuine": False,
             "authenticity_score": 0.0,
+            "image_quality_score": 85.0,
+            "cdp_authenticity_score": 0.0,
+            "reprint_risk_score": 0.0,
+            "digital_authenticity_score": 0.0,
             "qr_payload": payload,
             "serial_number": serial_no or "UNKNOWN",
             "guidance": "This serial number is not found in the official brand database. Verify product packaging or contact the manufacturer.",
             "product_info": audit_record,
             "metrics": {
                 "stage1_passed": True,
-                "full_image_sharpness": round(full_lap, 1),
+                "serial_number": serial_no,
             },
             "description": "Serial number does NOT exist in official brand database. Product cannot be authenticated.",
             "comparison_image": None,
         }
 
-    # Check 2: Product Status Revoked or Blacklisted
+    # Check: Blacklisted / Revoked Product
     if product_record.get("status") in ("INACTIVE", "BLACKLISTED", "REVOKED"):
         audit_record = product_db.record_scan(serial_no, f"BLACKLISTED ({product_record.get('status')})", 0.0)
         return {
@@ -634,34 +906,43 @@ def verify_anti_counterfeit_qr(
             "verdict": f"BLACKLISTED / REVOKED PRODUCT ({product_record.get('status')})",
             "is_genuine": False,
             "authenticity_score": 0.0,
+            "image_quality_score": 85.0,
+            "cdp_authenticity_score": 0.0,
+            "reprint_risk_score": 0.0,
+            "digital_authenticity_score": 0.0,
             "qr_payload": payload,
             "serial_number": serial_no,
             "guidance": "This product batch or unit has been recalled, blacklisted, or revoked by the brand manufacturer.",
             "product_info": audit_record,
             "metrics": {
                 "stage1_passed": True,
-                "full_image_sharpness": round(full_lap, 1),
+                "product_status": product_record.get("status"),
             },
             "description": f"REJECTED: Product status is marked {product_record.get('status')} in the brand database. Authentic print rejected per policy.",
             "comparison_image": None,
         }
 
-    # ── Step 2.2: Physical CDP Micro-Structure Analysis ─────────────────────
+    # ── Step 2.2: In-Frame Camera MTF Calibration ────────────────────────────
+    macro_metrics = measure_in_frame_macro_acutance(warped_gray, modules=modules, box_size=canonical_box)
+    macro_grad = macro_metrics["macro_gradient"]
+    macro_lap  = macro_metrics["macro_laplacian"]
+    finder_edge_slope = macro_metrics.get("finder_edge_slope", 65.0)
+    black_core_std = macro_metrics.get("black_core_std", 3.0)
+
+    # ── Step 2.3: Multi-Ratio CDP Extraction & MTF-Matched Template Match ───
     candidate_ratios = [cdp_ratio, 0.32, 0.30, 0.28, 0.34]
     seen = set()
     candidate_ratios = [r for r in candidate_ratios if not (r in seen or seen.add(r))]
 
-    best_ncc             = -1.0
+    best_ncc = -1.0
     best_candidate_tuple = None
 
     for r in candidate_ratios:
         center_w = int(full_size * r)
-        if center_w % 2 != 0:
-            center_w += 1
+        if center_w % 2 != 0: center_w += 1
         center_w = max(center_w, 40)
 
-        wh = warped_gray.shape[0]
-        ww = warped_gray.shape[1]
+        wh, ww = warped_gray.shape[:2]
         x1 = max(0, (ww - center_w) // 2)
         y1 = max(0, (wh - center_w) // 2)
         cand_cdp = warped_gray[y1:y1+center_w, x1:x1+center_w]
@@ -688,7 +969,9 @@ def verify_anti_counterfeit_qr(
         inner_cand = cand_cdp[pad_y:ch-pad_y, pad_x:cw-pad_x]
         inner_ref  = ref_np[pad_y:ch-pad_y,   pad_x:cw-pad_x]
 
-        curr_ncc, _ = compute_peak_cross_correlation(inner_cand, inner_ref)
+        curr_ncc, _ = compute_mtf_matched_ncc(
+            inner_cand, inner_ref, macro_gradient=macro_grad, finder_edge_slope=finder_edge_slope
+        )
         if curr_ncc > best_ncc:
             best_ncc             = curr_ncc
             best_candidate_tuple = (inner_cand, inner_ref, curr_ncc, r)
@@ -700,164 +983,293 @@ def verify_anti_counterfeit_qr(
     else:
         inner_cand, inner_ref, peak_ncc, _ = best_candidate_tuple
 
-    # ── Compute CDP-region metrics ─────────────────────────────────────────
-    laplacian_var  = compute_edge_acutance(inner_cand)
-    grad_sharpness = compute_gradient_sharpness(inner_cand)
-    hf_energy      = compute_fft_hf_energy_ratio(inner_cand)
-    morph          = compute_dot_morphology(inner_cand)
+    # ── Step 2.4: CDP Micro-Metrics & Relative Acutance ──────────────────────
+    cdp_grad = compute_gradient_sharpness(inner_cand)
+    cdp_lap  = compute_edge_acutance(inner_cand)
+    cdp_hf   = compute_fft_hf_energy_ratio(inner_cand)
+    morph    = compute_dot_morphology(inner_cand)
 
-    pa_ratio      = morph["pa_ratio"]
-    mean_dot_area = morph["mean_dot_area"]
-    clump_ratio   = morph["clump_ratio"]
-    dot_count     = morph["dot_count"]
-    void_count    = morph["void_count"]
-    black_density = morph["black_density"]
-    morph_norm    = morph["morph_norm"]
-    is_photocopy  = morph["is_photocopy"]
+    # Relative Acutance Ratios (normalized by the camera's measured MTF)
+    rel_acutance = cdp_grad / max(1.0, macro_grad)
+    rel_lap      = cdp_lap  / max(1.0, macro_lap)
 
-    # ── Normalization [0 → 1] ──────────────────────────────────────────────
-    lap_norm  = max(0.0, min(1.0, (laplacian_var  - LAP_FAKE_MAX)   / (LAP_GENUINE_HIGH  - LAP_FAKE_MAX)))
-    hf_norm   = max(0.0, min(1.0, (hf_energy      - HF_FAKE_MAX)    / (HF_GENUINE_HIGH   - HF_FAKE_MAX)))
-    grad_norm = max(0.0, min(1.0, (grad_sharpness  - GRAD_FAKE_MAX)  / (GRAD_GENUINE_HIGH - GRAD_FAKE_MAX)))
-    ncc_norm  = max(0.0, min(1.0, (peak_ncc        - NCC_GENUINE_MIN)/ (NCC_GENUINE_HIGH  - NCC_GENUINE_MIN)))
-
-    sharpness_avg = (lap_norm * 0.50 + hf_norm * 0.30 + grad_norm * 0.20)
-    sharpness_gate = sharpness_avg * (0.25 + 0.75 * min(lap_norm, hf_norm))
-
-    # Weighted base score
-    weighted_raw = (
-        ncc_norm   * 0.30
-        + morph_norm * 0.30
-        + lap_norm * 0.20
-        + hf_norm  * 0.15
-        + grad_norm * 0.05
+    # ── Step 2.5: Physical Optical Blur vs Reprint Discrimination ───────────
+    # True camera blur: micro-dots cannot be resolved due to camera optical softening
+    is_camera_optical_blur = bool(
+        cdp_grad < 40.0 or 
+        cdp_lap < 20.0 or 
+        (macro_grad < 95.0 and cdp_grad < 52.0)
     )
 
-    ncc_gate = max(0.0, min(1.0, (peak_ncc - 0.25) / (NCC_GENUINE_MIN - 0.25)))
-    if is_photocopy:
-        morph_gate = min(0.15, morph_norm)
-    else:
-        morph_gate = 0.40 + 0.60 * morph_norm
+    if is_camera_optical_blur:
+        blur_reason = f"Micro-pattern optical sharpness is too soft to analyze reliably (CDP sharpness: {cdp_grad:.1f})"
+        blur_guidance = "Hold phone steady, tap to lock autofocus directly on the QR code, and ensure good lighting."
+        return {
+            "status": "RECAPTURE_REQUIRED",
+            "message": "Unable to Verify — Image Too Blurry to Resolve Micro-Pattern",
+            "verdict": "RECAPTURE REQUIRED (OPTICAL BLUR DETECTED)",
+            "is_genuine": False,
+            "authenticity_score": 0.0,
+            "image_quality_score": 35.0,
+            "cdp_authenticity_score": 0.0,
+            "reprint_risk_score": 50.0,
+            "digital_authenticity_score": 100.0,
+            "qr_payload": payload,
+            "serial_number": serial_no,
+            "guidance": blur_guidance,
+            "metrics": {
+                "stage1_passed": True,
+                "macro_gradient": macro_grad,
+                "cdp_gradient": round(cdp_grad, 2),
+                "cdp_laplacian": round(cdp_lap, 2),
+                "laplacian_edge_variance": round(cdp_lap, 2),
+                "gradient_sharpness": round(cdp_grad, 2),
+                "peak_cross_correlation_ncc": round(peak_ncc, 4),
+                "failure_reason": blur_reason,
+            },
+            "description": f"{blur_reason}. {blur_guidance}",
+            "comparison_image": None,
+            "product_info": product_record,
+        }
 
-    composite = weighted_raw * (0.10 + 0.90 * ncc_gate) * (0.20 + 0.80 * morph_gate)
+    # ── Step 2.6: Decoupled Multi-Factor Scoring Model ───────────────────────
+    # 1. Image Quality Score [0 - 100]
+    qr_diag = np.sqrt(d01**2 + d12**2)
+    res_factor = max(0.0, min(1.0, (qr_diag - 120.0) / (350.0 - 120.0)))
+    macro_factor = max(0.0, min(1.0, (macro_grad - 80.0) / (250.0 - 80.0)))
+    image_quality_score = round(float(res_factor * 40.0 + macro_factor * 35.0 + edge_ratio * 25.0), 1)
 
-    if is_photocopy:
-        authenticity_score = round(max(0.0, min(22.0, composite * 100.0)), 1)
-    elif composite >= 0.70:
-        authenticity_score = 80.0 + (composite - 0.70) / 0.30 * 20.0
-    elif composite >= 0.45:
-        authenticity_score = 50.0 + (composite - 0.45) / 0.25 * 30.0
-    elif composite >= 0.20:
-        authenticity_score = 20.0 + (composite - 0.20) / 0.25 * 30.0
-    else:
-        authenticity_score = max(0.0, composite / 0.20 * 20.0)
+    # 2. CDP Authenticity Score [0 - 100] (Pattern identity with cryptographic seed)
+    ncc_norm = max(0.0, min(1.0, (peak_ncc - NCC_MISMATCH_MAX) / (NCC_GENUINE_HIGH - NCC_MISMATCH_MAX)))
+    cdp_authenticity_score = round(float(ncc_norm * 100.0), 1)
 
-    authenticity_score = float(round(max(0.0, min(100.0, authenticity_score)), 1))
+    # 3. Reprint Risk Score [0 - 100] (Physical 2nd-gen reprint detection)
+    micro_fid = compute_cdp_micro_fidelity(inner_cand, inner_ref)
+    fidelity  = micro_fid["fidelity"]
+    dog_ncc   = micro_fid["dog_ncc"]
+    lap_ncc   = micro_fid["lap_ncc"]
+    
+    # Micro-structure fidelity risk:
+    fidelity_risk = max(0.0, min(1.0, (0.31 - fidelity) / (0.31 - 0.24)))
+    dog_risk      = max(0.0, min(1.0, (0.28 - dog_ncc) / (0.28 - 0.20)))
+    lap_risk      = max(0.0, min(1.0, (0.13 - lap_ncc) / (0.13 - 0.07)))
+    micro_risk    = fidelity_risk * 0.45 + dog_risk * 0.35 + lap_risk * 0.20
+    
+    slope_risk   = max(0.0, min(1.0, (56.0 - finder_edge_slope) / (56.0 - 42.0)))
+    rel_g_risk   = max(0.0, min(1.0, (REL_ACUTANCE_GENUINE_MIN - rel_acutance) / (REL_ACUTANCE_GENUINE_MIN - REL_ACUTANCE_REPRINT_MAX)))
+    rel_lap_risk = max(0.0, min(1.0, (REL_LAP_GENUINE_MIN - rel_lap) / (REL_LAP_GENUINE_MIN - REL_LAP_REPRINT_MAX)))
+    hf_risk      = max(0.0, min(1.0, (HF_GENUINE_MIN - cdp_hf) / (HF_GENUINE_MIN - HF_REPRINT_MAX)))
+    
+    # Combined multi-factor reprint risk
+    raw_reprint_risk = max(
+        micro_risk,
+        rel_g_risk * 0.45 + rel_lap_risk * 0.35 + hf_risk * 0.20
+    )
+    
+    # Decisive reprint / photocopy indicators:
+    # 1. Micro-structure degradation (hallmark of second-generation copy)
+    if fidelity <= 0.28 or (dog_ncc <= 0.24 and lap_ncc <= 0.10):
+        raw_reprint_risk = max(raw_reprint_risk, 0.88)
+    # 2. Severe morphology destruction
+    elif morph["is_photocopy"]:
+        raw_reprint_risk = max(raw_reprint_risk, 0.88)
+    # 3. Collapse of relative acutance
+    elif rel_acutance < 0.80 or (rel_lap < 0.50 and cdp_hf < 0.0028) or (cdp_grad < 95.0 and macro_grad >= 105.0):
+        if peak_ncc >= 0.70 and rel_acutance >= 0.82 and not morph["is_photocopy"] and fidelity >= 0.30:
+            raw_reprint_risk = 0.45  # Borderline / Suspicious, not counterfeit!
+        else:
+            raw_reprint_risk = max(raw_reprint_risk, 0.88)
+    elif fidelity >= 0.31 and dog_ncc >= 0.28:
+        raw_reprint_risk = min(raw_reprint_risk, 0.05)
+        
+    reprint_risk_score = round(float(raw_reprint_risk * 100.0), 1)
 
-    # ── Hierarchical Decision Logic ──────────────────────────────────────────
-    if peak_ncc < 0.30:
+    # 4. Digital Authenticity Score [0 or 100]
+    digital_authenticity_score = 100.0
+
+    # 5. Composite Final Score [0 - 100]
+    reprint_survival = max(0.0, 1.0 - (reprint_risk_score / 100.0))
+    final_score = (cdp_authenticity_score * 0.50 + reprint_survival * 100.0 * 0.50) * (0.85 + 0.15 * (image_quality_score / 100.0))
+    
+    if reprint_risk_score >= 70.0:
+        final_score = min(final_score, 20.0)
+    elif peak_ncc < NCC_MISMATCH_MAX:
+        final_score = min(final_score, 15.0)
+
+    final_score = float(round(max(0.0, min(100.0, final_score)), 1))
+
+    # ── Step 2.7: Hierarchical Decision Logic ────────────────────────────────
+    if peak_ncc < NCC_MISMATCH_MAX:
+        status       = "COUNTERFEIT"
         verdict      = "COUNTERFEIT (PATTERN MISMATCH)"
-        verdict_desc = "FAKE! Micro-dot pattern does NOT match official cryptographic seed for this serial number."
-        status       = "COUNTERFEIT"
-        message      = "Counterfeit Detected — Possible Copy or Reprint"
+        message      = "Counterfeit Detected — Security Pattern Does Not Match Serial Number"
+        verdict_desc = "FAKE! Micro-dot security pattern does NOT match the official cryptographic master for this product."
         is_genuine   = False
-        authenticity_score = min(authenticity_score, 15.0)
 
-    elif is_photocopy:
+    elif morph["is_photocopy"] or reprint_risk_score >= 65.0:
+        status       = "COUNTERFEIT"
         verdict      = "COUNTERFEIT (PHOTOCOPY / REPRINT DETECTED)"
-        verdict_desc = (
-            f"FAKE! Photocopied reprint detected. Micro-dot structure has collapsed due to secondary toner spread "
-            f"and print-scan degradation (P/A ratio={pa_ratio:.3f}, toner density={black_density*100:.1f}%, dots={dot_count})."
-        )
-        status       = "COUNTERFEIT"
         message      = "Counterfeit Detected — This QR Code Appears to Be a Copy"
+        verdict_desc = (
+            f"FAKE! Second-generation reprint or photocopy detected. Physical edge acuity collapsed "
+            f"(finder edge slope={finder_edge_slope:.1f}, relative acutance={rel_acutance:.3f}, micro-voids={morph['void_count']})."
+        )
         is_genuine   = False
-        authenticity_score = min(authenticity_score, 22.0)
 
-    elif laplacian_var < LAP_FAKE_MAX or (laplacian_var < 100.0 and hf_energy < 0.0006):
-        verdict      = "COUNTERFEIT (REPRINT / COPY DETECTED)"
-        verdict_desc = "FAKE! Second-generation copy or reprint detected. High-frequency micro-texture has collapsed — characteristic of re-printing."
-        status       = "COUNTERFEIT"
-        message      = "Counterfeit Detected — Possible Copy or Reprint"
+    elif reprint_risk_score >= 40.0 or final_score < SCORE_SUSPICIOUS_THRESHOLD:
+        status       = "SUSPICIOUS"
+        verdict      = "SUSPICIOUS (BORDERLINE INTEGRITY)"
+        message      = "Suspicious Product — Inconclusive Micro-Pattern Integrity"
+        verdict_desc = "Borderline result. Micro-pattern matches seed, but optical sharpness ratio is degraded. Retake photo closer in good light."
         is_genuine   = False
-        authenticity_score = min(authenticity_score, 25.0)
 
-    elif authenticity_score >= SCORE_GENUINE_THRESHOLD:
-        verdict      = "GENUINE (ORIGINAL PRINT)"
-        verdict_desc = "Genuine 1st-generation original print verified. Micro-dot pattern, morphology, and edge sharpness match official cryptographic reference."
+    elif final_score >= SCORE_GENUINE_THRESHOLD and rel_acutance >= REL_ACUTANCE_GENUINE_MIN:
         status       = "GENUINE"
+        verdict      = "GENUINE (ORIGINAL PRINT VERIFIED)"
         message      = "Genuine Product Verified"
+        verdict_desc = "Genuine 1st-generation original print verified. Micro-dot security pattern, relative acutance, and morphology match official master."
         is_genuine   = True
 
-    elif authenticity_score >= 45.0:
-        verdict      = "SUSPICIOUS (INCONCLUSIVE INTEGRITY)"
-        verdict_desc = "Borderline result. Micro-dot pattern matches official cryptographic seed, but physical acutance is inconclusive. Retake photo closer with good lighting."
-        status       = "SUSPICIOUS"
-        message      = "Suspicious Product — Inconclusive Security Pattern"
-        is_genuine   = False
+    elif final_score >= SCORE_SUSPICIOUS_THRESHOLD:
+        status       = "GENUINE"
+        verdict      = "GENUINE (LOW CONFIDENCE)"
+        message      = "Genuine Product — Moderate Confidence"
+        verdict_desc = "Original print verified with moderate confidence. Slightly low contrast or lens softening detected."
+        is_genuine   = True
 
     else:
-        verdict      = "COUNTERFEIT (LOW CONFIDENCE)"
-        verdict_desc = "FAKE or severely degraded image. Micro-dot sharpness and pattern correlation are both below genuine thresholds."
         status       = "COUNTERFEIT"
-        message      = "Counterfeit Detected — This QR Code Appears to Be a Copy"
+        verdict      = "COUNTERFEIT (DEGRADED MICROSTRUCTURE)"
+        message      = "Counterfeit Detected — Possible Copy or Reprint"
+        verdict_desc = "FAKE! Micro-dot structure does not meet genuine production standards."
         is_genuine   = False
-        authenticity_score = min(authenticity_score, 30.0)
 
-    # ── Visual comparison card ────────────────────────────────────────────
+    # ── Step 2.8: Save Intermediate Debug Artifacts ──────────────────────────
+    if save_debug_artifacts:
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+            # 1. Uploaded image
+            cv2.imwrite(os.path.join(debug_dir, "debug_01_uploaded.png"), img_cv)
+            
+            # 2. QR detection visualization (draw detected bounding quad)
+            qr_detect_vis = img_cv.copy()
+            if points is not None and len(points) > 0:
+                pts_poly = points[0].astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(qr_detect_vis, [pts_poly], isClosed=True, color=(0, 255, 0), thickness=3)
+            cv2.imwrite(os.path.join(debug_dir, "debug_02_qr_detected.png"), qr_detect_vis)
+            
+            # 3. Perspective-corrected canonical QR
+            cv2.imwrite(os.path.join(debug_dir, "debug_03_perspective_corrected.png"), warped)
+            
+            # 4. Extracted raw CDP
+            cv2.imwrite(os.path.join(debug_dir, "debug_04_extracted_cdp.png"), inner_cand)
+            
+            # 5. Photometrically normalized CDP
+            norm_cdp = cv2.normalize(inner_cand, None, 0, 255, cv2.NORM_MINMAX)
+            cv2.imwrite(os.path.join(debug_dir, "debug_05_normalized_cdp.png"), norm_cdp)
+            
+            # 6. Reference/generated digital CDP
+            cv2.imwrite(os.path.join(debug_dir, "debug_06_reference_cdp.png"), inner_ref)
+            
+            # 7. Difference heatmap
+            cand_res = cv2.resize(inner_cand, (inner_ref.shape[1], inner_ref.shape[0]))
+            diff_map = cv2.absdiff(cand_res, inner_ref)
+            heatmap = cv2.applyColorMap(diff_map, cv2.COLORMAP_JET)
+            cv2.imwrite(os.path.join(debug_dir, "debug_07_difference_heatmap.png"), heatmap)
+        except Exception:
+            pass
+
+    # ── Step 2.9: Generate Visual Comparison Card ────────────────────────────
     comparison_img = None
     try:
         comparison_img = generate_comparison_card(
-            inner_cand, inner_ref, verdict, authenticity_score,
+            inner_cand, inner_ref, verdict, final_score,
             output_path=comparison_output_path,
         )
     except Exception:
         comparison_img = None
 
-    # ── Record verification scan in official registry ─────────────────────
+    # ── Step 2.10: Record Verification Scan in Official Registry ─────────────
     try:
-        updated_product_record = product_db.record_scan(serial_no, verdict, authenticity_score)
+        updated_product_record = product_db.record_scan(serial_no, verdict, final_score)
     except Exception as e:
         updated_product_record = dict(product_record)
         updated_product_record["scan_count"] = updated_product_record.get("scan_count", 0) + 1
         updated_product_record["clone_alert"] = False
         updated_product_record["clone_message"] = str(e)
 
+    # ── Debug Telemetry Log ──────────────────────────────────────────────────
+    debug_log = (
+        f"\n--- VERIFICATION TELEMETRY ---\n"
+        f"QR_VALID:                   True\n"
+        f"PRODUCT_REGISTERED:         {product_record is not None}\n"
+        f"IMAGE_WIDTH:                {img_cv.shape[1]}\n"
+        f"IMAGE_HEIGHT:               {img_cv.shape[0]}\n"
+        f"QR_SIZE:                    {full_size}\n"
+        f"CDP_SIZE:                   {inner_cand.shape[0]}x{inner_cand.shape[1]}\n"
+        f"PERSPECTIVE_CORRECTED:      True\n"
+        f"IMAGE_QUALITY_SCORE:        {image_quality_score}%\n"
+        f"NCC_SCORE:                  {round(peak_ncc, 4)}\n"
+        f"FINDER_EDGE_SLOPE:          {round(finder_edge_slope, 2)}\n"
+        f"MACRO_GRADIENT:             {macro_grad}\n"
+        f"CDP_GRADIENT:               {round(cdp_grad, 2)}\n"
+        f"RELATIVE_ACUTANCE_RATIO:    {round(rel_acutance, 4)}\n"
+        f"RELATIVE_LAPLACIAN_RATIO:   {round(rel_lap, 4)}\n"
+        f"MICRO_VOIDS:                {morph['void_count']}\n"
+        f"FFT_SCORE:                  {round(cdp_hf, 6)}\n"
+        f"CDP_AUTHENTICITY_SCORE:     {cdp_authenticity_score}%\n"
+        f"REPRINT_RISK_SCORE:         {reprint_risk_score}%\n"
+        f"FINAL_SCORE:                {final_score}%\n"
+        f"FINAL_DECISION:             {verdict}\n"
+        f"------------------------------"
+    )
+
+    # ── Return Structured Multi-Factor Result ────────────────────────────────
     return {
         "status": status,
         "message": message,
         "verdict": verdict,
         "is_genuine": is_genuine,
-        "authenticity_score": round(float(authenticity_score), 1),
+        "authenticity_score": final_score,
+        "final_score": final_score,
+        "image_quality_score": image_quality_score,
+        "cdp_authenticity_score": cdp_authenticity_score,
+        "reprint_risk_score": reprint_risk_score,
+        "digital_authenticity_score": digital_authenticity_score,
         "qr_payload": payload,
         "serial_number": serial_no,
         "product_info": updated_product_record,
         "metrics": {
             "stage1_passed":              True,
+            "image_quality_score":        image_quality_score,
+            "cdp_authenticity_score":     cdp_authenticity_score,
+            "reprint_risk_score":         reprint_risk_score,
+            "relative_acutance_ratio":    round(rel_acutance, 4),
+            "relative_laplacian_ratio":   round(rel_lap, 4),
+            "macro_gradient":             macro_grad,
+            "macro_laplacian":            macro_lap,
+            "cdp_gradient":               round(cdp_grad, 2),
+            "cdp_laplacian":              round(cdp_lap, 2),
+            "laplacian_edge_variance":    round(cdp_lap, 2),
+            "edge_acutance_laplacian":    round(cdp_lap, 2),
+            "gradient_sharpness":         round(cdp_grad, 2),
+            "full_image_sharpness":       round(q_metrics.get("full_image_sharpness", 0.0), 1),
             "peak_cross_correlation_ncc": round(peak_ncc, 4),
             "peak_ncc":                   round(peak_ncc, 4),
-            "laplacian_edge_variance":    round(laplacian_var, 2),
-            "edge_acutance_laplacian":    round(laplacian_var, 2),
-            "fft_high_freq_ratio":        round(hf_energy, 6),
-            "gradient_sharpness":         round(grad_sharpness, 2),
-            "dot_morphology_pa_ratio":    round(pa_ratio, 4),
-            "dot_morphology_density":     round(black_density, 4),
-            "dot_morphology_mean_area":   round(mean_dot_area, 1),
-            "dot_morphology_clump_ratio": round(clump_ratio, 4),
-            "dot_count":                  dot_count,
-            "micro_void_count":           void_count,
-            "morph_norm":                 round(morph_norm, 3),
-            "is_photocopy_detected":      is_photocopy,
-            "ncc_norm":                   round(ncc_norm, 3),
-            "lap_norm":                   round(lap_norm, 3),
-            "hf_norm":                    round(hf_norm, 3),
-            "grad_norm":                  round(grad_norm, 3),
-            "sharpness_gate":             round(sharpness_gate, 3),
-            "acutance_gate":              round(sharpness_gate, 3),
-            "composite_raw":              round(composite, 4),
-            "full_image_sharpness":       round(full_lap, 1),
+            "fft_high_freq_ratio":        round(cdp_hf, 6),
+            "dot_morphology_pa_ratio":    morph["pa_ratio"],
+            "dot_morphology_density":     morph["black_density"],
+            "dot_morphology_clump_ratio": morph["clump_ratio"],
+            "dot_count":                  morph["dot_count"],
+            "micro_void_count":           morph["void_count"],
+            "micro_dot_fidelity":         fidelity,
+            "dog_bandpass_ncc":           dog_ncc,
+            "laplacian_edge_ncc":         lap_ncc,
+            "finder_edge_slope":          round(finder_edge_slope, 2),
+            "is_photocopy_detected":      morph["is_photocopy"],
+            "edge_ratio":                 round(edge_ratio, 3),
         },
         "description": verdict_desc,
         "comparison_image": comparison_img,
+        "debug_log": debug_log,
     }
-

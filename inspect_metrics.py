@@ -1,47 +1,18 @@
-import cv2
-import numpy as np
+import cdp_engine, simulator, cdp_verifier
 
-def compute_fft_hf_ratio(gray, cutoff_ratio=0.20):
-    f = np.fft.fft2(gray.astype(np.float32))
-    fshift = np.fft.fftshift(f)
-    mag = np.abs(fshift)**2
-    h, w = gray.shape
-    cy, cx = h // 2, w // 2
-    y, x = np.ogrid[:h, :w]
-    dist = np.sqrt((x - cx)**2 + (y - cy)**2)
-    cutoff = min(h, w) * cutoff_ratio
-    low = np.sum(mag[dist <= cutoff])
-    high = np.sum(mag[dist > cutoff])
-    total = low + high
-    return float(high / total) if total > 0 else 0.0
+s = 'PROD-MULTI-TEST-2026'
+qr, _ = cdp_engine.create_anti_counterfeit_qr(payload='https://x.com/?id=' + s, serial_no=s)
 
-master = cv2.imread("master_anti_counterfeit_qr.png", 0)
-h, w = master.shape
-cw = int(w * 0.32)
-x1, y1 = (w - cw) // 2, (h - cw) // 2
-master_crop = master[y1+20:y1+cw-20, x1+20:x1+cw-20]
+print("--- 1ST-GEN GENUINE SCANS ---")
+for p in ['phone_a', 'phone_b', 'phone_c', 'phone_d', 'phone_e']:
+    img = simulator.simulate_phone_capture(qr, phone_model=p, add_background=True)
+    res = cdp_verifier.verify_anti_counterfeit_qr(img, expected_serial=s)
+    m = res['metrics']
+    print(f"{p:<8} | Macro_G: {m['macro_gradient']:>6.1f} | CDP_G: {m['cdp_gradient']:>6.1f} | Rel_G: {m['relative_acutance_ratio']:>6.3f} | Rel_Lap: {m['relative_laplacian_ratio']:>6.3f} | HF: {m['fft_high_freq_ratio']:>8.5f} | Score: {res['authenticity_score']}")
 
-gen_scan = cv2.imread("sample_genuine_scan.png", 0)
-gen_crop = gen_scan[y1+20:y1+cw-20, x1+20:x1+cw-20]
-
-fake_scan = cv2.imread("sample_counterfeit_reprint.png", 0)
-fake_crop = fake_scan[y1+20:y1+cw-20, x1+20:x1+cw-20]
-
-samples = {
-    "1. Master Digital (Pristine)": master_crop,
-    "2. Blurred sigma=0.6": cv2.GaussianBlur(master_crop, (0, 0), 0.6),
-    "3. Blurred sigma=0.8": cv2.GaussianBlur(master_crop, (0, 0), 0.8),
-    "4. Blurred sigma=1.2": cv2.GaussianBlur(master_crop, (0, 0), 1.2),
-    "5. Genuine Mobile Scan": gen_crop,
-    "6. Counterfeit Reprint": fake_crop,
-}
-
-print(f"{'Sample':<32} | {'Laplacian':<10} | {'FFT HF':<10} | {'Sobel Grad':<10}")
-print("-" * 70)
-for name, img in samples.items():
-    lap = cv2.Laplacian(img, cv2.CV_64F).var()
-    hf = compute_fft_hf_ratio(img, cutoff_ratio=0.20)
-    sobelx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
-    sobely = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
-    grad = np.mean(np.sqrt(sobelx**2 + sobely**2))
-    print(f"{name:<32} | {lap:<10.1f} | {hf:<10.4f} | {grad:<10.1f}")
+print("\n--- 2ND-GEN COUNTERFEIT REPRINTS ---")
+for p in ['phone_a', 'phone_b', 'phone_c', 'phone_d', 'phone_e']:
+    fake_img = simulator.simulate_counterfeit_reprint_captured(qr, phone_model=p, add_background=True)
+    res = cdp_verifier.verify_anti_counterfeit_qr(fake_img, expected_serial=s)
+    m = res['metrics']
+    print(f"{p:<8} | Macro_G: {m['macro_gradient']:>6.1f} | CDP_G: {m['cdp_gradient']:>6.1f} | Rel_G: {m['relative_acutance_ratio']:>6.3f} | Rel_Lap: {m['relative_laplacian_ratio']:>6.3f} | HF: {m['fft_high_freq_ratio']:>8.5f} | Score: {res['authenticity_score']}")
