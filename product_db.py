@@ -5,11 +5,13 @@ Manages product metadata, batch tracking, scan counters,
 and audit logs for anti-counterfeit verification.
 """
 
+import os
 import sqlite3
 import datetime
 from typing import Optional, Dict, Any, List
 
-DB_PATH = "products.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "products.db"))
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -207,6 +209,15 @@ def get_all_products() -> List[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM products ORDER BY created_at DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def list_all_products(limit: int = 50) -> List[Dict[str, Any]]:
+    """Returns registered products with a limit."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM products ORDER BY created_at DESC LIMIT ?", (limit,))
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
