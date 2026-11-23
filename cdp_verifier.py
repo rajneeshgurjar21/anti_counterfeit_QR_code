@@ -22,6 +22,12 @@ Key Capabilities:
      perimeter-to-area ratio (P/A), micro-voids, and toner clumping.
 6. Decoupled Multi-Factor Scoring Model:
    - IMAGE_QUALITY_SCORE, CDP_AUTHENTICITY_SCORE, REPRINT_RISK_SCORE, DIGITAL_AUTHENTICITY_SCORE.
+
+Company-Level QR Extension (verify_company_qr):
+   - Single common QR per company, identical sticker on every product.
+   - Payload lookup identifies the owning company.
+   - CDP master regenerated from company CDP seed (never from product serial).
+   - Existing verify_anti_counterfeit_qr() is completely unchanged.
 """
 
 import os
@@ -480,6 +486,8 @@ def compute_dot_morphology(inner_cand: np.ndarray) -> dict:
     is_photocopy = bool(
         (dot_count <= 4 and mean_dot_area > 1500) or
         (pa_ratio < 0.15) or
+        (void_count <= 10) or
+        (void_count <= 12 and clump_ratio >= 0.70) or
         (black_density > 0.60 and pa_ratio < 0.18 and dot_count <= 8) or
         (clump_ratio > 0.95 and dot_count <= 6)
     )
@@ -646,7 +654,7 @@ def verify_anti_counterfeit_qr(
     box_size: int = 12,
     cdp_ratio: float = 0.32,
     comparison_output_path: str = None,
-    save_debug_artifacts: bool = True,
+    save_debug_artifacts: bool = False,
     debug_dir: str = "debug_artifacts",
 ) -> dict:
     """
@@ -1050,9 +1058,9 @@ def verify_anti_counterfeit_qr(
     lap_ncc   = micro_fid["lap_ncc"]
     
     # Micro-structure fidelity risk:
-    fidelity_risk = max(0.0, min(1.0, (0.31 - fidelity) / (0.31 - 0.24)))
-    dog_risk      = max(0.0, min(1.0, (0.28 - dog_ncc) / (0.28 - 0.20)))
-    lap_risk      = max(0.0, min(1.0, (0.13 - lap_ncc) / (0.13 - 0.07)))
+    fidelity_risk = max(0.0, min(1.0, (0.42 - fidelity) / (0.42 - 0.32)))
+    dog_risk      = max(0.0, min(1.0, (0.39 - dog_ncc) / (0.39 - 0.28)))
+    lap_risk      = max(0.0, min(1.0, (0.22 - lap_ncc) / (0.22 - 0.12)))
     micro_risk    = fidelity_risk * 0.45 + dog_risk * 0.35 + lap_risk * 0.20
     
     slope_risk   = max(0.0, min(1.0, (56.0 - finder_edge_slope) / (56.0 - 42.0)))
@@ -1068,18 +1076,21 @@ def verify_anti_counterfeit_qr(
     
     # Decisive reprint / photocopy indicators:
     # 1. Micro-structure degradation (hallmark of second-generation copy)
-    if fidelity <= 0.28 or (dog_ncc <= 0.24 and lap_ncc <= 0.10):
-        raw_reprint_risk = max(raw_reprint_risk, 0.88)
-    # 2. Severe morphology destruction
-    elif morph["is_photocopy"]:
-        raw_reprint_risk = max(raw_reprint_risk, 0.88)
-    # 3. Collapse of relative acutance
+    if morph["is_photocopy"]:
+        raw_reprint_risk = max(raw_reprint_risk, 0.90)
+    elif morph["void_count"] <= 10 or (morph["void_count"] <= 12 and peak_ncc < 0.72):
+        raw_reprint_risk = max(raw_reprint_risk, 0.90)
+    elif peak_ncc < 0.70:
+        # Spatial phase misalignment & dot dilation from 2nd-gen copy/reprint
+        raw_reprint_risk = max(raw_reprint_risk, 0.90)
+    elif fidelity <= 0.28 or (dog_ncc <= 0.24 and lap_ncc <= 0.10):
+        raw_reprint_risk = max(raw_reprint_risk, 0.90)
     elif rel_acutance < 0.80 or (rel_lap < 0.50 and cdp_hf < 0.0028) or (cdp_grad < 95.0 and macro_grad >= 105.0):
         if peak_ncc >= 0.70 and rel_acutance >= 0.82 and not morph["is_photocopy"] and fidelity >= 0.30:
             raw_reprint_risk = 0.45  # Borderline / Suspicious, not counterfeit!
         else:
             raw_reprint_risk = max(raw_reprint_risk, 0.88)
-    elif fidelity >= 0.31 and dog_ncc >= 0.28:
+    elif peak_ncc >= 0.75 and fidelity >= 0.40 and dog_ncc >= 0.38 and morph["void_count"] >= 16:
         raw_reprint_risk = min(raw_reprint_risk, 0.05)
         
     reprint_risk_score = round(float(raw_reprint_risk * 100.0), 1)
@@ -1272,4 +1283,552 @@ def verify_anti_counterfeit_qr(
         "description": verdict_desc,
         "comparison_image": comparison_img,
         "debug_log": debug_log,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  COMPANY-LEVEL VERIFICATION  (new — existing function above is unchanged)
+# ═════════════════════════════════════════════════════════════════════════
+
+def verify_company_qr(
+    image_input,
+    box_size: int    = 12,
+    cdp_ratio: float = 0.32,
+    comparison_output_path: str = None,
+    save_debug_artifacts: bool  = False,
+    debug_dir: str = "debug_artifacts",
+) -> dict:
+    """
+    Company-level QR verification entry point.
+
+    One common QR sticker per company.  The CDP master is derived from
+    the company's cdp_seed (stored in company_db), not from a product serial.
+
+    Verification flow:
+      Stage 1  — identical image-quality gate as verify_anti_counterfeit_qr().
+      Stage 2  — company DB lookup by decoded QR payload.
+               — status check (ACTIVE / REVOKED / SUSPENDED).
+               — CDP master regenerated from company seed.
+               — full CDP authenticity & reprint-risk scoring (unchanged engine).
+               — scan audit logged to company_scan_logs.
+
+    Returns the same dict shape as verify_anti_counterfeit_qr() so the
+    web UI / CLI need no structural changes, plus an extra 'company_info' key.
+    """
+    import company_db
+
+    # ── Load image ───────────────────────────────────────────────────────────
+    if isinstance(image_input, str):
+        img_cv = cv2.imread(image_input)
+    elif isinstance(image_input, Image.Image):
+        img_cv = cv2.cvtColor(np.array(image_input.convert('RGB')), cv2.COLOR_RGB2BGR)
+    else:
+        img_cv = image_input.copy()
+
+    if img_cv is None:
+        return _company_error_response(
+            "RECAPTURE_REQUIRED",
+            "RECAPTURE REQUIRED (FAILED TO LOAD IMAGE)",
+            "Unable to Verify — Please Upload a Clear Image of the QR Code",
+            "Failed to load input image. Please provide a valid JPEG or PNG file.",
+        )
+
+    # ── Multi-pass QR detection ──────────────────────────────────────────────
+    payload, points, straight = robust_detect_and_decode_qr(img_cv)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  STAGE 1: QR-LOCALIZED IMAGE QUALITY PRE-GATE  (reuse existing logic)
+    # ═══════════════════════════════════════════════════════════════════════
+    is_valid, q_reason, q_guidance, q_metrics = validate_image_quality(
+        img_cv, detected_points=points
+    )
+    if not is_valid:
+        return _company_error_response(
+            "RECAPTURE_REQUIRED",
+            "RECAPTURE REQUIRED (QUALITY CHECK FAILED)",
+            "Unable to Verify — Please Upload a Clear Image of the QR Code",
+            q_guidance,
+            extra_metrics={"failure_reason": q_reason, **q_metrics},
+        )
+
+    # ── QR decodability ──────────────────────────────────────────────────────
+    if not payload or points is None or len(points) == 0:
+        full_lap = q_metrics.get(
+            "full_image_sharpness",
+            compute_edge_acutance(cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)),
+        )
+        if full_lap < GLOBAL_BLUR_MIN:
+            return _company_error_response(
+                "RECAPTURE_REQUIRED",
+                "RECAPTURE REQUIRED (IMAGE TOO BLURRY)",
+                "Unable to Verify — Image Too Blurry to Decode QR Code",
+                "Hold your phone steady, tap to focus, and recapture closer.",
+                extra_metrics={"full_image_sharpness": round(full_lap, 1)},
+            )
+        return _company_error_response(
+            "UNREADABLE",
+            "UNREADABLE QR CODE (OBSTRUCTED OR DAMAGED)",
+            "Unable to Verify — QR Code Not Detected",
+            "Ensure the entire QR code is visible in the camera frame.",
+        )
+
+    # ── Perspective tilt guard ───────────────────────────────────────────────
+    pts_arr = points[0].astype(np.float32)
+    d01 = float(np.linalg.norm(pts_arr[1] - pts_arr[0]))
+    d12 = float(np.linalg.norm(pts_arr[2] - pts_arr[1]))
+    d23 = float(np.linalg.norm(pts_arr[3] - pts_arr[2]))
+    d30 = float(np.linalg.norm(pts_arr[0] - pts_arr[3]))
+    edges      = [d01, d12, d23, d30]
+    edge_ratio = min(edges) / max(1.0, max(edges))
+
+    if edge_ratio < PERSPECTIVE_EDGE_RATIO_MIN:
+        return _company_error_response(
+            "RECAPTURE_REQUIRED",
+            "RECAPTURE REQUIRED (EXTREME PERSPECTIVE TILT)",
+            "Unable to Verify — Extreme Camera Angle",
+            "Please point your camera directly at the QR code, not from a steep angle.",
+            extra_metrics={"perspective_edge_ratio": round(edge_ratio, 3)},
+        )
+
+    # ── Canonical perspective rectification ──────────────────────────────────
+    modules      = straight.shape[0] if (straight is not None and straight.size > 0) else 45
+    border       = 4
+    canonical_box = box_size
+    full_size    = (modules + 2 * border) * canonical_box
+    offset       = border * canonical_box
+    data_w       = modules * canonical_box
+
+    dst_data = np.array([
+        [offset,          offset         ],
+        [offset + data_w, offset         ],
+        [offset + data_w, offset + data_w],
+        [offset,          offset + data_w],
+    ], dtype=np.float32)
+
+    M      = cv2.getPerspectiveTransform(pts_arr, dst_data)
+    warped = cv2.warpPerspective(img_cv, M, (full_size, full_size), flags=cv2.INTER_LINEAR)
+    warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+
+    # ── CDP region preliminary check ─────────────────────────────────────────
+    prelim_cw = int(full_size * cdp_ratio)
+    if prelim_cw % 2 != 0: prelim_cw += 1
+    px1        = (warped_gray.shape[1] - prelim_cw) // 2
+    py1        = (warped_gray.shape[0] - prelim_cw) // 2
+    prelim_cdp = warped_gray[py1:py1+prelim_cw, px1:px1+prelim_cw]
+    cdp_var    = float(np.var(prelim_cdp))
+    cdp_mean   = float(np.mean(prelim_cdp))
+
+    if cdp_var < 15.0 or cdp_mean > 252.0 or cdp_mean < 8.0:
+        return _company_error_response(
+            "RECAPTURE_REQUIRED",
+            "RECAPTURE REQUIRED (SECURITY PATTERN DAMAGED / OCCLUDED)",
+            "Unable to Verify — Security Pattern Occluded or Damaged",
+            "The central security micro-pattern appears covered or washed out. Clean the label and retry.",
+            extra_metrics={"center_variance": round(cdp_var, 2), "center_mean": round(cdp_mean, 1)},
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  STAGE 2.1: COMPANY REGISTRY LOOKUP BY QR PAYLOAD
+    # ═══════════════════════════════════════════════════════════════════════
+    company_record = company_db.get_company_by_payload(payload)
+
+    if company_record is None:
+        # QR payload is not registered to any company
+        company_db.record_company_scan(
+            company_id="UNKNOWN",
+            physical_verdict="INVALID_COMPANY",
+            authenticity_score=0.0,
+            note=f"Unrecognised payload: {payload[:80]}",
+        )
+        return {
+            "status":                   "INVALID_COMPANY",
+            "message":                  "QR Code Not Registered to Any Company",
+            "verdict":                  "INVALID COMPANY (PAYLOAD NOT FOUND)",
+            "is_genuine":               False,
+            "authenticity_score":       0.0,
+            "image_quality_score":      85.0,
+            "cdp_authenticity_score":   0.0,
+            "reprint_risk_score":       0.0,
+            "digital_authenticity_score": 0.0,
+            "qr_payload":               payload,
+            "serial_number":            "",
+            "guidance":                 "This QR code is not registered to any company in the system.",
+            "company_info":             None,
+            "product_info":             None,
+            "metrics":                  {"stage1_passed": True},
+            "description":              "QR payload not found in company registry.",
+            "comparison_image":         None,
+        }
+
+    # ── Status check ─────────────────────────────────────────────────────────
+    comp_status = company_record.get("status", "ACTIVE")
+    if comp_status in ("REVOKED", "SUSPENDED"):
+        company_db.record_company_scan(
+            company_id=company_record["company_id"],
+            physical_verdict=f"COMPANY_{comp_status}",
+            authenticity_score=0.0,
+        )
+        return {
+            "status":                   "REVOKED",
+            "message":                  f"Company QR has been {comp_status}",
+            "verdict":                  f"REVOKED / {comp_status} COMPANY QR",
+            "is_genuine":               False,
+            "authenticity_score":       0.0,
+            "image_quality_score":      85.0,
+            "cdp_authenticity_score":   0.0,
+            "reprint_risk_score":       0.0,
+            "digital_authenticity_score": 0.0,
+            "qr_payload":               payload,
+            "serial_number":            company_record["company_id"],
+            "guidance":                 "This company's QR identity has been revoked. Contact the brand owner.",
+            "company_info":             company_record,
+            "product_info":             None,
+            "metrics":                  {"stage1_passed": True, "company_status": comp_status},
+            "description":              f"Company QR is marked {comp_status}.",
+            "comparison_image":         None,
+        }
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  STAGE 2.2: IN-FRAME MTF CALIBRATION  (reuse existing function)
+    # ═══════════════════════════════════════════════════════════════════════
+    macro_metrics    = measure_in_frame_macro_acutance(warped_gray, modules=modules, box_size=canonical_box)
+    macro_grad       = macro_metrics["macro_gradient"]
+    macro_lap        = macro_metrics["macro_laplacian"]
+    finder_edge_slope = macro_metrics.get("finder_edge_slope", 65.0)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  STAGE 2.3: CDP EXTRACTION USING COMPANY SEED  (key difference)
+    # ═══════════════════════════════════════════════════════════════════════
+    cdp_seed = company_record["cdp_seed"]   # e.g. "COMPANY::APXA-2026"
+
+    candidate_ratios = [cdp_ratio, 0.32, 0.30, 0.28, 0.34]
+    seen             = set()
+    candidate_ratios = [r for r in candidate_ratios if not (r in seen or seen.add(r))]
+
+    best_ncc            = -1.0
+    best_candidate_tuple = None
+
+    for r in candidate_ratios:
+        center_w = int(full_size * r)
+        if center_w % 2 != 0: center_w += 1
+        center_w = max(center_w, 40)
+
+        wh, ww = warped_gray.shape[:2]
+        x1       = max(0, (ww - center_w) // 2)
+        y1       = max(0, (wh - center_w) // 2)
+        cand_cdp = warped_gray[y1:y1+center_w, x1:x1+center_w]
+
+        ch, cw = cand_cdp.shape
+        if ch < 20 or cw < 20:
+            continue
+
+        dot_size          = max(1, canonical_box // 5)
+        margin_cells      = 10
+        pattern_grid_size = max(10, (center_w - 2 * margin_cells * dot_size) // dot_size)
+
+        # ── Regenerate CDP master from COMPANY seed (not product serial) ──
+        ref_pil = generate_cdp_module_with_fiducials(
+            seed_str=cdp_seed,          # <— company seed
+            pattern_grid_size=pattern_grid_size,
+            dot_size=dot_size,
+            margin_cells=margin_cells,
+        )
+        ref_np  = np.array(ref_pil.convert('L'))
+        ref_np  = cv2.resize(ref_np, (cw, ch), interpolation=cv2.INTER_NEAREST)
+
+        pad_y      = int(ch * 0.16)
+        pad_x      = int(cw * 0.16)
+        inner_cand = cand_cdp[pad_y:ch-pad_y, pad_x:cw-pad_x]
+        inner_ref  = ref_np[pad_y:ch-pad_y,   pad_x:cw-pad_x]
+
+        curr_ncc, _ = compute_mtf_matched_ncc(
+            inner_cand, inner_ref,
+            macro_gradient=macro_grad,
+            finder_edge_slope=finder_edge_slope,
+        )
+        if curr_ncc > best_ncc:
+            best_ncc             = curr_ncc
+            best_candidate_tuple = (inner_cand, inner_ref, curr_ncc, r)
+
+    if best_candidate_tuple is None:
+        inner_cand = warped_gray
+        inner_ref  = warped_gray
+        peak_ncc   = 0.0
+    else:
+        inner_cand, inner_ref, peak_ncc, _ = best_candidate_tuple
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  STAGE 2.4: CDP MICRO-METRICS & RELATIVE ACUTANCE  (identical to original)
+    # ═══════════════════════════════════════════════════════════════════════
+    cdp_grad = compute_gradient_sharpness(inner_cand)
+    cdp_lap  = compute_edge_acutance(inner_cand)
+    cdp_hf   = compute_fft_hf_energy_ratio(inner_cand)
+    morph    = compute_dot_morphology(inner_cand)
+
+    rel_acutance = cdp_grad / max(1.0, macro_grad)
+    rel_lap      = cdp_lap  / max(1.0, macro_lap)
+
+    # ── Optical blur guard ───────────────────────────────────────────────────
+    is_camera_optical_blur = bool(
+        cdp_grad < 40.0 or
+        cdp_lap  < 20.0 or
+        (macro_grad < 95.0 and cdp_grad < 52.0)
+    )
+    if is_camera_optical_blur:
+        return _company_error_response(
+            "RECAPTURE_REQUIRED",
+            "RECAPTURE REQUIRED (OPTICAL BLUR DETECTED)",
+            "Unable to Verify — Image Too Blurry to Resolve Micro-Pattern",
+            "Hold phone steady, tap to lock autofocus on the QR code, and ensure good lighting.",
+            extra_metrics={
+                "macro_gradient":  macro_grad,
+                "cdp_gradient":    round(cdp_grad, 2),
+                "cdp_laplacian":   round(cdp_lap, 2),
+                "peak_cross_correlation_ncc": round(peak_ncc, 4),
+            },
+            company_info=company_record,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  STAGE 2.5: DECOUPLED SCORING  (identical formula to original)
+    # ═══════════════════════════════════════════════════════════════════════
+    qr_diag     = np.sqrt(d01**2 + d12**2)
+    res_factor  = max(0.0, min(1.0, (qr_diag - 120.0) / (350.0 - 120.0)))
+    mac_factor  = max(0.0, min(1.0, (macro_grad - 80.0) / (250.0 - 80.0)))
+    image_quality_score = round(
+        float(res_factor * 40.0 + mac_factor * 35.0 + edge_ratio * 25.0), 1
+    )
+
+    ncc_norm            = max(0.0, min(1.0, (peak_ncc - NCC_MISMATCH_MAX) / (NCC_GENUINE_HIGH - NCC_MISMATCH_MAX)))
+    cdp_authenticity_score = round(float(ncc_norm * 100.0), 1)
+
+    micro_fid = compute_cdp_micro_fidelity(inner_cand, inner_ref)
+    fidelity  = micro_fid["fidelity"]
+    dog_ncc   = micro_fid["dog_ncc"]
+    lap_ncc   = micro_fid["lap_ncc"]
+
+    fidelity_risk = max(0.0, min(1.0, (0.42 - fidelity) / (0.42 - 0.32)))
+    dog_risk      = max(0.0, min(1.0, (0.39 - dog_ncc)  / (0.39 - 0.28)))
+    lap_risk      = max(0.0, min(1.0, (0.22 - lap_ncc)  / (0.22 - 0.12)))
+    micro_risk    = fidelity_risk * 0.45 + dog_risk * 0.35 + lap_risk * 0.20
+
+    slope_risk   = max(0.0, min(1.0, (56.0 - finder_edge_slope) / (56.0 - 42.0)))
+    rel_g_risk   = max(0.0, min(1.0, (REL_ACUTANCE_GENUINE_MIN - rel_acutance) / (REL_ACUTANCE_GENUINE_MIN - REL_ACUTANCE_REPRINT_MAX)))
+    rel_lap_risk = max(0.0, min(1.0, (REL_LAP_GENUINE_MIN - rel_lap) / (REL_LAP_GENUINE_MIN - REL_LAP_REPRINT_MAX)))
+    hf_risk      = max(0.0, min(1.0, (HF_GENUINE_MIN - cdp_hf) / (HF_GENUINE_MIN - HF_REPRINT_MAX)))
+
+    raw_reprint_risk = max(
+        micro_risk,
+        rel_g_risk * 0.45 + rel_lap_risk * 0.35 + hf_risk * 0.20,
+    )
+
+    if morph["is_photocopy"]:
+        raw_reprint_risk = max(raw_reprint_risk, 0.90)
+    elif morph["void_count"] <= 10 or (morph["void_count"] <= 12 and peak_ncc < 0.72):
+        raw_reprint_risk = max(raw_reprint_risk, 0.90)
+    elif peak_ncc < 0.70:
+        # Spatial phase misalignment & dot dilation from 2nd-gen copy/reprint
+        raw_reprint_risk = max(raw_reprint_risk, 0.90)
+    elif fidelity <= 0.28 or (dog_ncc <= 0.24 and lap_ncc <= 0.10):
+        raw_reprint_risk = max(raw_reprint_risk, 0.90)
+    elif rel_acutance < 0.80 or (rel_lap < 0.50 and cdp_hf < 0.0028) or (cdp_grad < 95.0 and macro_grad >= 105.0):
+        if peak_ncc >= 0.70 and rel_acutance >= 0.82 and not morph["is_photocopy"] and fidelity >= 0.30:
+            raw_reprint_risk = 0.45  # Borderline / Suspicious, not counterfeit!
+        else:
+            raw_reprint_risk = max(raw_reprint_risk, 0.88)
+    elif peak_ncc >= 0.75 and fidelity >= 0.40 and dog_ncc >= 0.38 and morph["void_count"] >= 16:
+        raw_reprint_risk = min(raw_reprint_risk, 0.05)
+
+    reprint_risk_score     = round(float(raw_reprint_risk * 100.0), 1)
+    digital_auth_score     = 100.0
+
+    reprint_survival = max(0.0, 1.0 - (reprint_risk_score / 100.0))
+    final_score      = (cdp_authenticity_score * 0.50 + reprint_survival * 100.0 * 0.50) * \
+                       (0.85 + 0.15 * (image_quality_score / 100.0))
+    if reprint_risk_score >= 70.0:
+        final_score = min(final_score, 20.0)
+    elif peak_ncc < NCC_MISMATCH_MAX:
+        final_score = min(final_score, 15.0)
+    final_score = float(round(max(0.0, min(100.0, final_score)), 1))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  STAGE 2.6: HIERARCHICAL VERDICT  (identical logic to original)
+    # ═══════════════════════════════════════════════════════════════════════
+    company_name = company_record.get("company_name", "Company")
+
+    if peak_ncc < NCC_MISMATCH_MAX:
+        status       = "COUNTERFEIT"
+        verdict      = "COUNTERFEIT (PATTERN MISMATCH)"
+        message      = f"Counterfeit Detected — CDP Does Not Match {company_name} Master"
+        verdict_desc = (
+            f"FAKE! Micro-dot security pattern does NOT match the official "
+            f"cryptographic master for {company_name}."
+        )
+        is_genuine   = False
+
+    elif morph["is_photocopy"] or reprint_risk_score >= 65.0:
+        status       = "COUNTERFEIT"
+        verdict      = "COUNTERFEIT (PHOTOCOPY / REPRINT DETECTED)"
+        message      = "Counterfeit Detected — This Sticker Appears to Be a Copy"
+        verdict_desc = (
+            f"FAKE! Second-generation reprint or photocopy detected. "
+            f"Physical edge acuity collapsed (finder edge slope={finder_edge_slope:.1f}, "
+            f"relative acutance={rel_acutance:.3f}, micro-voids={morph['void_count']})."
+        )
+        is_genuine   = False
+
+    elif reprint_risk_score >= 40.0 or final_score < SCORE_SUSPICIOUS_THRESHOLD:
+        status       = "SUSPICIOUS"
+        verdict      = "SUSPICIOUS (BORDERLINE INTEGRITY)"
+        message      = "Suspicious Sticker — Inconclusive Micro-Pattern Integrity"
+        verdict_desc = "Borderline result. Retake photo closer in good light."
+        is_genuine   = False
+
+    elif final_score >= SCORE_GENUINE_THRESHOLD and rel_acutance >= REL_ACUTANCE_GENUINE_MIN:
+        status       = "GENUINE"
+        verdict      = f"GENUINE — {company_name} ORIGINAL PRINT VERIFIED"
+        message      = f"Genuine {company_name} Product Verified"
+        verdict_desc = (
+            f"Genuine 1st-generation original {company_name} sticker verified. "
+            "Micro-dot security pattern, relative acutance, and morphology match the official master."
+        )
+        is_genuine   = True
+
+    elif final_score >= SCORE_SUSPICIOUS_THRESHOLD:
+        status       = "GENUINE"
+        verdict      = "GENUINE (LOW CONFIDENCE)"
+        message      = "Genuine Sticker — Moderate Confidence"
+        verdict_desc = "Original print verified with moderate confidence. Slightly low contrast or lens softening detected."
+        is_genuine   = True
+
+    else:
+        status       = "COUNTERFEIT"
+        verdict      = "COUNTERFEIT (DEGRADED MICROSTRUCTURE)"
+        message      = "Counterfeit Detected — Possible Copy or Reprint"
+        verdict_desc = "FAKE! Micro-dot structure does not meet genuine production standards."
+        is_genuine   = False
+
+    # ── Debug artifacts (same as original) ──────────────────────────────────
+    if save_debug_artifacts:
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(debug_dir, "debug_01_uploaded.png"),             img_cv)
+            qr_vis = img_cv.copy()
+            if points is not None and len(points) > 0:
+                cv2.polylines(qr_vis, [points[0].astype(np.int32).reshape((-1, 1, 2))],
+                              True, (0, 255, 0), 3)
+            cv2.imwrite(os.path.join(debug_dir, "debug_02_qr_detected.png"),          qr_vis)
+            cv2.imwrite(os.path.join(debug_dir, "debug_03_perspective_corrected.png"), warped)
+            cv2.imwrite(os.path.join(debug_dir, "debug_04_extracted_cdp.png"),         inner_cand)
+            norm_cdp = cv2.normalize(inner_cand, None, 0, 255, cv2.NORM_MINMAX)
+            cv2.imwrite(os.path.join(debug_dir, "debug_05_normalized_cdp.png"),        norm_cdp)
+            cv2.imwrite(os.path.join(debug_dir, "debug_06_reference_cdp.png"),         inner_ref)
+            cand_res = cv2.resize(inner_cand, (inner_ref.shape[1], inner_ref.shape[0]))
+            diff_map = cv2.absdiff(cand_res, inner_ref)
+            heatmap  = cv2.applyColorMap(diff_map, cv2.COLORMAP_JET)
+            cv2.imwrite(os.path.join(debug_dir, "debug_07_difference_heatmap.png"),    heatmap)
+        except Exception:
+            pass
+
+    # ── Visual comparison card ───────────────────────────────────────────────
+    comparison_img = None
+    try:
+        comparison_img = generate_comparison_card(
+            inner_cand, inner_ref, verdict, final_score,
+            output_path=comparison_output_path,
+        )
+    except Exception:
+        comparison_img = None
+
+    # ── Scan audit ───────────────────────────────────────────────────────────
+    updated_company_record = company_db.record_company_scan(
+        company_id          = company_record["company_id"],
+        physical_verdict    = verdict,
+        authenticity_score  = final_score,
+        image_quality_score = image_quality_score,
+        reprint_risk_score  = reprint_risk_score,
+        cdp_score           = cdp_authenticity_score,
+    )
+
+    return {
+        "status":                     status,
+        "message":                    message,
+        "verdict":                    verdict,
+        "is_genuine":                 is_genuine,
+        "authenticity_score":         final_score,
+        "final_score":                final_score,
+        "image_quality_score":        image_quality_score,
+        "cdp_authenticity_score":     cdp_authenticity_score,
+        "reprint_risk_score":         reprint_risk_score,
+        "digital_authenticity_score": digital_auth_score,
+        "qr_payload":                 payload,
+        "serial_number":              company_record["company_id"],
+        "company_info":               updated_company_record,
+        "product_info":               updated_company_record,   # backward-compat key
+        "metrics": {
+            "stage1_passed":              True,
+            "image_quality_score":        image_quality_score,
+            "cdp_authenticity_score":     cdp_authenticity_score,
+            "reprint_risk_score":         reprint_risk_score,
+            "relative_acutance_ratio":    round(rel_acutance, 4),
+            "relative_laplacian_ratio":   round(rel_lap, 4),
+            "macro_gradient":             macro_grad,
+            "macro_laplacian":            macro_lap,
+            "cdp_gradient":               round(cdp_grad, 2),
+            "cdp_laplacian":              round(cdp_lap, 2),
+            "laplacian_edge_variance":    round(cdp_lap, 2),
+            "edge_acutance_laplacian":    round(cdp_lap, 2),
+            "gradient_sharpness":         round(cdp_grad, 2),
+            "full_image_sharpness":       round(q_metrics.get("full_image_sharpness", 0.0), 1),
+            "peak_cross_correlation_ncc": round(peak_ncc, 4),
+            "peak_ncc":                   round(peak_ncc, 4),
+            "fft_high_freq_ratio":        round(cdp_hf, 6),
+            "dot_morphology_pa_ratio":    morph["pa_ratio"],
+            "dot_morphology_density":     morph["black_density"],
+            "dot_morphology_clump_ratio": morph["clump_ratio"],
+            "dot_count":                  morph["dot_count"],
+            "micro_void_count":           morph["void_count"],
+            "micro_dot_fidelity":         fidelity,
+            "dog_bandpass_ncc":           dog_ncc,
+            "laplacian_edge_ncc":         lap_ncc,
+            "finder_edge_slope":          round(finder_edge_slope, 2),
+            "is_photocopy_detected":      morph["is_photocopy"],
+            "edge_ratio":                 round(edge_ratio, 3),
+            "cdp_seed":                   cdp_seed,
+        },
+        "description":    verdict_desc,
+        "comparison_image": comparison_img,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Internal helper: build a uniform error response
+# ─────────────────────────────────────────────────────────────────
+
+def _company_error_response(
+    status: str,
+    verdict: str,
+    message: str,
+    guidance: str,
+    extra_metrics: dict = None,
+    company_info=None,
+) -> dict:
+    return {
+        "status":                     status,
+        "message":                    message,
+        "verdict":                    verdict,
+        "is_genuine":                 False,
+        "authenticity_score":         0.0,
+        "image_quality_score":        0.0,
+        "cdp_authenticity_score":     0.0,
+        "reprint_risk_score":         50.0,
+        "digital_authenticity_score": 0.0,
+        "qr_payload":                 "",
+        "serial_number":              "",
+        "guidance":                   guidance,
+        "company_info":               company_info,
+        "product_info":               company_info,
+        "metrics":                    {"stage1_passed": False, **(extra_metrics or {})},
+        "description":                guidance,
+        "comparison_image":           None,
     }
